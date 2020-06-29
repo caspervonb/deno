@@ -10,10 +10,12 @@
  */
 import { assertEquals, assert } from "../testing/asserts.ts";
 
-import { resolve } from "../path/mod.ts";
+import { dirname, fromFileUrl, resolve } from "../path/mod.ts";
+
 import { Tar, Untar } from "./tar.ts";
 
-const filePath = resolve("archive", "testdata", "example.txt");
+const rootDir = dirname(fromFileUrl(import.meta.url));
+const filePath = resolve("testdata", "example.txt");
 
 interface TestEntry {
   name: string;
@@ -192,7 +194,7 @@ Deno.test(
       },
     ];
 
-    const outputFile = resolve("archive", "testdata", "test.tar");
+    const outputFile = resolve(rootDir, "testdata", "test.tar");
 
     const tar = await createTar(entries);
     const file = await Deno.open(outputFile, { create: true, write: true });
@@ -227,7 +229,7 @@ Deno.test("untarAsyncIteratorFromFileReader", async function (): Promise<void> {
     },
   ];
 
-  const outputFile = resolve("archive", "testdata", "test.tar");
+  const outputFile = resolve(rootDir, "testdata", "test.tar");
 
   const tar = await createTar(entries);
   const file = await Deno.open(outputFile, { create: true, write: true });
@@ -303,7 +305,7 @@ Deno.test(
 );
 
 Deno.test("untarLinuxGeneratedTar", async function (): Promise<void> {
-  const filePath = resolve("archive", "testdata", "deno.tar");
+  const filePath = resolve(rootDir, "testdata", "deno.tar");
   const file = await Deno.open(filePath, { read: true });
 
   const expectedEntries = [

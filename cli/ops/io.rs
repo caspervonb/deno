@@ -391,8 +391,36 @@ pub fn op_write(
       })
     })
   } else {
-    let zero_copy = zero_copy[0].clone();
+    let mut zero_copy = zero_copy[0].clone();
     let resource_table = isolate_state.resource_table.clone();
+    MinimalOp::Async(
+      poll_fn(move |cx| {
+        let mut resource_table = resource_table.borrow_mut();
+        let resource_holder = resource_table
+          .get_mut::<StreamResourceHolder>(rid as u32)
+          .ok_or_else(OpError::bad_resource_id)?;
+
+        let mut task_tracker_id: Option<usize> = None;
+        let nwritten = match resource_holder
+          .resource
+          .poll_write(cx, &mut zero_copy)
+          .map_err(OpError::from)
+        {
+          Poll::Ready(t) => {
+            if let Some(id) = task_tracker_id {
+              resource_holder.untrack_task(id);
+            }
+            t
+          }
+          Poll::Pending => {
+            task_tracker_id.replace(resource_holder.track_task(cx)?);
+            return Poll::Pending;
+          }
+        }?;
+        Poll::Ready(Ok(nwritten as i32))
+      })
+      .boxed_local(),
+      /*
     MinimalOp::Async(
       async move {
         let nwritten = poll_fn(|cx| {
@@ -420,6 +448,7 @@ pub fn op_write(
         Ok(nwritten as i32)
       }
       .boxed_local(),
+      */
     )
   }
 }

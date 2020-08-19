@@ -121,9 +121,11 @@ Deno.test("echo blob with binaryType blob", async () => {
   const blob = new Blob(["foo"]);
   ws.onerror = (): void => fail();
   ws.onopen = (): void => ws.send(blob);
-  ws.onmessage = async (e): Promise<void> => {
-    assertEquals(await e.data.text(), await blob.text());
-    ws.close();
+  ws.onmessage = (e): void => {
+    Promise.all([e.data.text(), blob.text]).then((actual, expected) => {
+      assertEquals(actual, expected);
+      ws.close();
+    });
   };
   ws.onclose = (): void => {
     promise.resolve();

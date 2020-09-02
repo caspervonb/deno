@@ -1,5 +1,3 @@
-/* eslint-disable */
-
 import { assert, assertEquals } from "../testing/asserts.ts";
 import { copy } from "../fs/mod.ts";
 import * as path from "../path/mod.ts";

@@ -430,7 +430,26 @@ async fn run_repl(flags: Flags) -> Result<(), AnyError> {
     ModuleSpecifier::resolve_url_or_path("./$deno$repl.ts").unwrap();
   let global_state = GlobalState::new(flags)?;
   let mut worker = MainWorker::new(&global_state, main_module.clone());
-  (&mut *worker).await?;
+
+  let main_module_url = main_module.as_url().to_owned();
+
+  // Create a dummy source file with an interval to keep the script alive, this is done so that
+  // the context does not get destroyed.
+  let source_file = SourceFile {
+    filename: main_module_url.to_file_path().unwrap(),
+    url: main_module_url,
+    types_header: None,
+    media_type: MediaType::TypeScript,
+    source_code: "".into(),
+  };
+
+  // Save our fake file into file fetcher cache
+  // to allow module access by TS compiler
+  global_state
+    .file_fetcher
+    .save_source_file_in_cache(&main_module, source_file);
+
+  worker.execute_module(&main_module).await?;
 
   let inspector = worker
     .inspector

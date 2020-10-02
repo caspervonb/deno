@@ -1253,6 +1253,21 @@ fn repl_test_multiline() {
 }
 
 #[test]
+fn repl_test_await_import() {
+  let (out, err) = util::run_and_collect_output(
+    true,
+    "repl",
+    Some(vec!["(import('./subdir/mod1.ts')).then(function(m) { m.printHello()});"]),
+    Some(vec![("NO_COLOR".to_owned(), "1".to_owned())]),
+    false,
+  );
+  println!("{}", &out);
+  println!("{}", &err);
+  assert!(out.ends_with("Promise { <pending> }\nHello\n"));
+  assert!(err.is_empty());
+}
+
+#[test]
 fn repl_test_eval_unterminated() {
   let (out, err) = util::run_and_collect_output(
     true,

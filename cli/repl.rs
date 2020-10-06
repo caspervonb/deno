@@ -67,7 +67,7 @@ async fn read_line_and_poll(
         return result.unwrap();
       }
       _ = &mut *worker => {
-        tokio::time::delay_for(tokio::time::Duration::from_millis(0)).await;
+        return line.await.unwrap();
       }
     }
   }
@@ -152,7 +152,10 @@ pub async fn run(
   .await?;
 
   loop {
+    (&mut *worker).await;
+
     let line = read_line_and_poll(&mut *worker, editor.clone()).await;
+
     match line {
       Ok(line) => {
         // It is a bit unexpected that { "foo": "bar" } is interpreted as a block

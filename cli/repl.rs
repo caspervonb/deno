@@ -152,7 +152,7 @@ pub async fn run(
   .await?;
 
   loop {
-    (&mut *worker).await;
+    (&mut *worker).await?;
 
     let line = read_line_and_poll(&mut *worker, editor.clone()).await;
 

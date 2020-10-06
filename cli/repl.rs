@@ -39,6 +39,7 @@ async fn post_message_and_poll(
   params: Option<Value>,
 ) -> Result<Value, AnyError> {
   let response = session.post_message(method.to_string(), params);
+
   tokio::pin!(response);
 
   loop {
@@ -152,8 +153,6 @@ pub async fn run(
   .await?;
 
   loop {
-    (&mut *worker).await?;
-
     let line = read_line_and_poll(&mut *worker, editor.clone()).await;
 
     match line {

@@ -44,13 +44,6 @@ const ignore = [
   "testdata/wasi_clock_time_get.wasm",
 ];
 
-// TODO(caspervonb) investigate why these tests are failing on windows and fix
-// them.
-if (Deno.build.os == "windows") {
-  ignore.push("testdata/std_fs_metadata.wasm");
-  ignore.push("testdata/std_fs_read_dir.wasm");
-}
-
 const rootdir = path.dirname(path.fromFileUrl(import.meta.url));
 const testdir = path.join(rootdir, "testdata");
 
@@ -64,7 +57,11 @@ for (const pathname of tests) {
       );
       const options = JSON.parse(prelude);
 
-      const workdir = await Deno.makeTempDir();
+      const workdir = await Deno.makeTempDir({
+        dir: testdir,
+        prefix: path.basename(pathname),
+      });
+
       await copy(
         path.join(testdir, "fixtures"),
         path.join(workdir, "fixtures"),

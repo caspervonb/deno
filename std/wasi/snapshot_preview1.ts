@@ -1588,14 +1588,14 @@ export default class Context {
     const { _start, _initialize, memory } = instance.exports;
 
     if (!(memory instanceof WebAssembly.Memory)) {
-      throw new TypeError("WebAsembly.instance must provide a memory export");
+      throw new TypeError("WebAssembly.Instance must provide a memory export");
     }
 
     this.memory = memory;
 
     if (typeof _initialize == "function") {
       throw new TypeError(
-        "WebAsembly.instance export _initialize must not be a function",
+        "WebAssembly.Instance export _initialize must not be a function",
       );
     }
 
@@ -1621,7 +1621,7 @@ export default class Context {
     const { _start, _initialize, memory } = instance.exports;
 
     if (!(memory instanceof WebAssembly.Memory)) {
-      throw new TypeError("WebAsembly.instance must provide a memory export");
+      throw new TypeError("WebAssembly.Instance must provide a memory export");
     }
 
     this.memory = memory;
@@ -1634,7 +1634,7 @@ export default class Context {
 
     if (typeof _initialize != "function") {
       throw new TypeError(
-        "WebAsembly.instance export _initialize must be a function",
+        "WebAssembly.Instance export _initialize must be a function",
       );
     }
 

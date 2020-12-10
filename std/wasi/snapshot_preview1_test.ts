@@ -164,7 +164,7 @@ Deno.test("context_start", function () {
       });
     },
     TypeError,
-    "export _initialize must not be a function",
+    "WebAssembly.Instance export _initialize must not be a function",
   );
 
   assertThrows(
@@ -177,7 +177,7 @@ Deno.test("context_start", function () {
       });
     },
     TypeError,
-    "export _start must be a function",
+    "WebAssembly.Instance export _start must be a function",
   );
 
   try {
@@ -210,7 +210,7 @@ Deno.test("context_initialize", function () {
       });
     },
     TypeError,
-    "must provide a memory export",
+    "WebAssembly.Instance must provide a memory export",
   );
 
   assertThrows(
@@ -224,7 +224,7 @@ Deno.test("context_initialize", function () {
       });
     },
     TypeError,
-    "export _start must not be a function",
+    "WebAssembly.Instance export _start must not be a function",
   );
 
   assertThrows(
@@ -237,6 +237,6 @@ Deno.test("context_initialize", function () {
       });
     },
     TypeError,
-    "export _initialize must be a function",
+    "WebAssembly.Instance export _initialize must be a function",
   );
 });

@@ -398,7 +398,6 @@ impl StreamResource {
         .borrow_mut()
         .await;
       let nwritten = (*fs_file).0.as_mut().unwrap().write(buf).await?;
-      (*fs_file).0.as_mut().unwrap().flush().await?;
       return Ok(nwritten);
     } else if self.child_stdin.is_some() {
       debug_assert!(self.child_stdout.is_none());
@@ -410,7 +409,6 @@ impl StreamResource {
           .borrow_mut()
           .await;
       let nwritten = child_stdin.write(buf).await?;
-      child_stdin.flush().await?;
       return Ok(nwritten);
     } else if self.client_tls_stream.is_some() {
       debug_assert!(self.server_tls_stream.is_none());
@@ -419,7 +417,6 @@ impl StreamResource {
           .borrow_mut()
           .await;
       let nwritten = client_tls_stream.write(buf).await?;
-      client_tls_stream.flush().await?;
       return Ok(nwritten);
     } else if self.server_tls_stream.is_some() {
       let mut server_tls_stream =
@@ -427,7 +424,6 @@ impl StreamResource {
           .borrow_mut()
           .await;
       let nwritten = server_tls_stream.write(buf).await?;
-      server_tls_stream.flush().await?;
       return Ok(nwritten);
     }
 
@@ -438,7 +434,6 @@ impl StreamResource {
           .borrow_mut()
           .await;
       let nwritten = unix_stream.write(buf).await?;
-      unix_stream.flush().await?;
       return Ok(nwritten);
     }
 

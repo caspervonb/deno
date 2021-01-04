@@ -1667,7 +1667,10 @@ async fn op_utime_async(
   let atime = filetime::FileTime::from_unix_time(args.atime.0, args.atime.1);
   let mtime = filetime::FileTime::from_unix_time(args.mtime.0, args.mtime.1);
 
-  state.borrow().borrow::<Permissions>().check_write(&path)?;
+  {
+    let state = state.borrow();
+    state.borrow::<Permissions>().check_write(&path)?;
+  }
 
   tokio::task::spawn_blocking(move || {
     filetime::set_file_times(path, atime, mtime)?;

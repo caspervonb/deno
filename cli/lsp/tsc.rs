@@ -1,53 +1,134 @@
-// Copyright 2018-2020 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
 
-use super::analysis::ResolvedImport;
-use super::state::ServerStateSnapshot;
+use super::analysis::CodeLensSource;
+use super::analysis::ResolvedDependency;
+use super::language_server::StateSnapshot;
 use super::text;
+use super::text::LineIndex;
 use super::utils;
 
-use crate::js;
 use crate::media_type::MediaType;
+use crate::tokio_util::create_basic_runtime;
 use crate::tsc;
 use crate::tsc::ResolveArgs;
 use crate::tsc_config::TsConfig;
 
+use deno_core::error::anyhow;
 use deno_core::error::custom_error;
 use deno_core::error::AnyError;
+use deno_core::futures::Future;
 use deno_core::json_op_sync;
 use deno_core::serde::Deserialize;
 use deno_core::serde::Serialize;
 use deno_core::serde_json;
 use deno_core::serde_json::json;
 use deno_core::serde_json::Value;
+use deno_core::url::Url;
 use deno_core::JsRuntime;
 use deno_core::ModuleSpecifier;
 use deno_core::OpFn;
 use deno_core::RuntimeOptions;
+use lspower::lsp;
 use regex::Captures;
 use regex::Regex;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::thread;
+use text_size::TextSize;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+
+type Request = (
+  RequestMethod,
+  StateSnapshot,
+  oneshot::Sender<Result<Value, AnyError>>,
+);
+
+#[derive(Clone, Debug)]
+pub struct TsServer(mpsc::UnboundedSender<Request>);
+
+impl TsServer {
+  pub fn new() -> Self {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Request>();
+    let _join_handle = thread::spawn(move || {
+      // TODO(@kitsonk) we need to allow displaying diagnostics here, but the
+      // current compiler snapshot sends them to stdio which would totally break
+      // the language server...
+      let mut ts_runtime = start(false).expect("could not start tsc");
+
+      let runtime = create_basic_runtime();
+      runtime.block_on(async {
+        while let Some((req, state_snapshot, tx)) = rx.recv().await {
+          let value = request(&mut ts_runtime, state_snapshot, req);
+          if tx.send(value).is_err() {
+            warn!("Unable to send result to client.");
+          }
+        }
+      })
+    });
+
+    Self(tx)
+  }
+
+  pub async fn request(
+    &self,
+    snapshot: StateSnapshot,
+    req: RequestMethod,
+  ) -> Result<Value, AnyError> {
+    let (tx, rx) = oneshot::channel::<Result<Value, AnyError>>();
+    if self.0.send((req, snapshot, tx)).is_err() {
+      return Err(anyhow!("failed to send request to tsc thread"));
+    }
+    rx.await?
+  }
+}
+
+/// An lsp representation of an asset in memory, that has either been retrieved
+/// from static assets built into Rust, or static assets built into tsc.
+#[derive(Debug, Clone)]
+pub struct AssetDocument {
+  pub text: String,
+  pub line_index: LineIndex,
+}
 
 /// Optionally returns an internal asset, first checking for any static assets
 /// in Rust, then checking any previously retrieved static assets from the
 /// isolate, and then finally, the tsc isolate itself.
-pub fn get_asset(
+pub async fn get_asset(
   specifier: &ModuleSpecifier,
-  runtime: &mut JsRuntime,
-  server_state: &ServerStateSnapshot,
-) -> Result<Option<String>, AnyError> {
+  ts_server: &TsServer,
+  state_snapshot: &mut StateSnapshot,
+) -> Result<Option<AssetDocument>, AnyError> {
   let specifier_str = specifier.to_string().replace("asset:///", "");
-  if let Some(asset_text) = tsc::get_asset(&specifier_str) {
-    Ok(Some(asset_text.to_string()))
+  if let Some(text) = tsc::get_asset(&specifier_str) {
+    let maybe_asset = Some(AssetDocument {
+      line_index: LineIndex::new(text),
+      text: text.to_string(),
+    });
+    state_snapshot
+      .assets
+      .insert(specifier.clone(), maybe_asset.clone());
+    Ok(maybe_asset)
   } else {
-    let mut assets = server_state.assets.write().unwrap();
-    if let Some(asset) = assets.get(specifier) {
-      Ok(asset.clone())
+    let res = ts_server
+      .request(
+        state_snapshot.clone(),
+        RequestMethod::GetAsset(specifier.clone()),
+      )
+      .await?;
+    let maybe_text: Option<String> = serde_json::from_value(res)?;
+    let maybe_asset = if let Some(text) = maybe_text {
+      Some(AssetDocument {
+        line_index: LineIndex::new(&text),
+        text,
+      })
     } else {
-      let asset = request_asset(specifier, runtime, server_state)?;
-      assets.insert(specifier.clone(), asset.clone());
-      Ok(asset)
-    }
+      None
+    };
+    state_snapshot
+      .assets
+      .insert(specifier.clone(), maybe_asset.clone());
+    Ok(maybe_asset)
   }
 }
 
@@ -161,7 +242,7 @@ fn replace_links(text: &str) -> String {
     .to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub enum ScriptElementKind {
   #[serde(rename = "")]
   Unknown,
@@ -233,9 +314,9 @@ pub enum ScriptElementKind {
   String,
 }
 
-impl From<ScriptElementKind> for lsp_types::CompletionItemKind {
+impl From<ScriptElementKind> for lsp::CompletionItemKind {
   fn from(kind: ScriptElementKind) -> Self {
-    use lsp_types::CompletionItemKind;
+    use lspower::lsp::CompletionItemKind;
 
     match kind {
       ScriptElementKind::PrimitiveType | ScriptElementKind::Keyword => {
@@ -276,15 +357,15 @@ impl From<ScriptElementKind> for lsp_types::CompletionItemKind {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextSpan {
-  start: u32,
-  length: u32,
+  pub start: u32,
+  pub length: u32,
 }
 
 impl TextSpan {
-  pub fn to_range(&self, line_index: &[u32]) -> lsp_types::Range {
-    lsp_types::Range {
-      start: text::to_position(line_index, self.start),
-      end: text::to_position(line_index, self.start + self.length),
+  pub fn to_range(&self, line_index: &LineIndex) -> lsp::Range {
+    lsp::Range {
+      start: line_index.position_tsc(self.start.into()),
+      end: line_index.position_tsc(TextSize::from(self.start + self.length)),
     }
   }
 }
@@ -315,12 +396,12 @@ pub struct QuickInfo {
 }
 
 impl QuickInfo {
-  pub fn to_hover(&self, line_index: &[u32]) -> lsp_types::Hover {
-    let mut contents = Vec::<lsp_types::MarkedString>::new();
+  pub fn to_hover(&self, line_index: &LineIndex) -> lsp::Hover {
+    let mut contents = Vec::<lsp::MarkedString>::new();
     if let Some(display_string) =
       display_parts_to_string(self.display_parts.clone())
     {
-      contents.push(lsp_types::MarkedString::from_language_code(
+      contents.push(lsp::MarkedString::from_language_code(
         "typescript".to_string(),
         display_string,
       ));
@@ -328,7 +409,7 @@ impl QuickInfo {
     if let Some(documentation) =
       display_parts_to_string(self.documentation.clone())
     {
-      contents.push(lsp_types::MarkedString::from_markdown(documentation));
+      contents.push(lsp::MarkedString::from_markdown(documentation));
     }
     if let Some(tags) = &self.tags {
       let tags_preview = tags
@@ -337,16 +418,198 @@ impl QuickInfo {
         .collect::<Vec<String>>()
         .join("  \n\n");
       if !tags_preview.is_empty() {
-        contents.push(lsp_types::MarkedString::from_markdown(format!(
+        contents.push(lsp::MarkedString::from_markdown(format!(
           "\n\n{}",
           tags_preview
         )));
       }
     }
-    lsp_types::Hover {
-      contents: lsp_types::HoverContents::Array(contents),
+    lsp::Hover {
+      contents: lsp::HoverContents::Array(contents),
       range: Some(self.text_span.to_range(line_index)),
     }
+  }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentSpan {
+  text_span: TextSpan,
+  pub file_name: String,
+  original_text_span: Option<TextSpan>,
+  original_file_name: Option<String>,
+  context_span: Option<TextSpan>,
+  original_context_span: Option<TextSpan>,
+}
+
+impl DocumentSpan {
+  pub async fn to_link<F, Fut>(
+    &self,
+    line_index: &LineIndex,
+    index_provider: F,
+  ) -> Option<lsp::LocationLink>
+  where
+    F: Fn(ModuleSpecifier) -> Fut,
+    Fut: Future<Output = Result<LineIndex, AnyError>>,
+  {
+    let target_specifier =
+      ModuleSpecifier::resolve_url(&self.file_name).unwrap();
+    if let Ok(target_line_index) = index_provider(target_specifier).await {
+      let target_uri = utils::normalize_file_name(&self.file_name).unwrap();
+      let (target_range, target_selection_range) =
+        if let Some(context_span) = &self.context_span {
+          (
+            context_span.to_range(&target_line_index),
+            self.text_span.to_range(&target_line_index),
+          )
+        } else {
+          (
+            self.text_span.to_range(&target_line_index),
+            self.text_span.to_range(&target_line_index),
+          )
+        };
+      let link = lsp::LocationLink {
+        origin_selection_range: Some(self.text_span.to_range(line_index)),
+        target_uri,
+        target_range,
+        target_selection_range,
+      };
+      Some(link)
+    } else {
+      None
+    }
+  }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationTree {
+  pub text: String,
+  pub kind: ScriptElementKind,
+  pub kind_modifiers: String,
+  pub spans: Vec<TextSpan>,
+  pub name_span: Option<TextSpan>,
+  pub child_items: Option<Vec<NavigationTree>>,
+}
+
+impl NavigationTree {
+  pub fn to_code_lens(
+    &self,
+    line_index: &LineIndex,
+    specifier: &ModuleSpecifier,
+    source: &CodeLensSource,
+  ) -> lsp::CodeLens {
+    lsp::CodeLens {
+      range: self.name_span.clone().unwrap().to_range(line_index),
+      command: None,
+      data: Some(json!({
+        "specifier": specifier,
+        "source": source
+      })),
+    }
+  }
+
+  pub fn walk<F>(&self, callback: &F)
+  where
+    F: Fn(&NavigationTree, Option<&NavigationTree>),
+  {
+    callback(self, None);
+    if let Some(child_items) = &self.child_items {
+      for child in child_items {
+        child.walk_child(callback, self);
+      }
+    }
+  }
+
+  fn walk_child<F>(&self, callback: &F, parent: &NavigationTree)
+  where
+    F: Fn(&NavigationTree, Option<&NavigationTree>),
+  {
+    callback(self, Some(parent));
+    if let Some(child_items) = &self.child_items {
+      for child in child_items {
+        child.walk_child(callback, self);
+      }
+    }
+  }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImplementationLocation {
+  #[serde(flatten)]
+  pub document_span: DocumentSpan,
+  // ImplementationLocation props
+  kind: ScriptElementKind,
+  display_parts: Vec<SymbolDisplayPart>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameLocation {
+  #[serde(flatten)]
+  document_span: DocumentSpan,
+  // RenameLocation props
+  prefix_text: Option<String>,
+  suffix_text: Option<String>,
+}
+
+pub struct RenameLocations {
+  pub locations: Vec<RenameLocation>,
+}
+
+impl RenameLocations {
+  pub async fn into_workspace_edit<F, Fut, V>(
+    self,
+    new_name: &str,
+    index_provider: F,
+    version_provider: V,
+  ) -> Result<lsp::WorkspaceEdit, AnyError>
+  where
+    F: Fn(ModuleSpecifier) -> Fut,
+    Fut: Future<Output = Result<LineIndex, AnyError>>,
+    V: Fn(ModuleSpecifier) -> Option<i32>,
+  {
+    let mut text_document_edit_map: HashMap<Url, lsp::TextDocumentEdit> =
+      HashMap::new();
+    for location in self.locations.iter() {
+      let uri = utils::normalize_file_name(&location.document_span.file_name)?;
+      let specifier =
+        ModuleSpecifier::resolve_url(&location.document_span.file_name)?;
+
+      // ensure TextDocumentEdit for `location.file_name`.
+      if text_document_edit_map.get(&uri).is_none() {
+        text_document_edit_map.insert(
+          uri.clone(),
+          lsp::TextDocumentEdit {
+            text_document: lsp::OptionalVersionedTextDocumentIdentifier {
+              uri: uri.clone(),
+              version: version_provider(specifier.clone()),
+            },
+            edits:
+              Vec::<lsp::OneOf<lsp::TextEdit, lsp::AnnotatedTextEdit>>::new(),
+          },
+        );
+      }
+
+      // push TextEdit for ensured `TextDocumentEdit.edits`.
+      let document_edit = text_document_edit_map.get_mut(&uri).unwrap();
+      document_edit.edits.push(lsp::OneOf::Left(lsp::TextEdit {
+        range: location
+          .document_span
+          .text_span
+          .to_range(&index_provider(specifier.clone()).await?),
+        new_text: new_name.to_string(),
+      }));
+    }
+
+    Ok(lsp::WorkspaceEdit {
+      change_annotations: None,
+      changes: None,
+      document_changes: Some(lsp::DocumentChanges::Edits(
+        text_document_edit_map.values().cloned().collect(),
+      )),
+    })
   }
 }
 
@@ -379,12 +642,9 @@ pub struct DefinitionInfo {
   name: String,
   container_kind: Option<ScriptElementKind>,
   container_name: Option<String>,
-  text_span: TextSpan,
-  pub file_name: String,
-  original_text_span: Option<TextSpan>,
-  original_file_name: Option<String>,
-  context_span: Option<TextSpan>,
-  original_context_span: Option<TextSpan>,
+
+  #[serde(flatten)]
+  pub document_span: DocumentSpan,
 }
 
 #[derive(Debug, Deserialize)]
@@ -395,44 +655,27 @@ pub struct DefinitionInfoAndBoundSpan {
 }
 
 impl DefinitionInfoAndBoundSpan {
-  pub fn to_definition<F>(
+  pub async fn to_definition<F, Fut>(
     &self,
-    line_index: &[u32],
-    mut index_provider: F,
-  ) -> Option<lsp_types::GotoDefinitionResponse>
+    line_index: &LineIndex,
+    index_provider: F,
+  ) -> Option<lsp::GotoDefinitionResponse>
   where
-    F: FnMut(ModuleSpecifier) -> Vec<u32>,
+    F: Fn(ModuleSpecifier) -> Fut + Clone,
+    Fut: Future<Output = Result<LineIndex, AnyError>>,
   {
     if let Some(definitions) = &self.definitions {
-      let location_links = definitions
-        .iter()
-        .map(|di| {
-          let target_specifier =
-            ModuleSpecifier::resolve_url(&di.file_name).unwrap();
-          let target_line_index = index_provider(target_specifier);
-          let target_uri = utils::normalize_file_name(&di.file_name).unwrap();
-          let (target_range, target_selection_range) =
-            if let Some(context_span) = &di.context_span {
-              (
-                context_span.to_range(&target_line_index),
-                di.text_span.to_range(&target_line_index),
-              )
-            } else {
-              (
-                di.text_span.to_range(&target_line_index),
-                di.text_span.to_range(&target_line_index),
-              )
-            };
-          lsp_types::LocationLink {
-            origin_selection_range: Some(self.text_span.to_range(line_index)),
-            target_uri,
-            target_range,
-            target_selection_range,
-          }
-        })
-        .collect();
-
-      Some(lsp_types::GotoDefinitionResponse::Link(location_links))
+      let mut location_links = Vec::<lsp::LocationLink>::new();
+      for di in definitions {
+        if let Some(link) = di
+          .document_span
+          .to_link(line_index, index_provider.clone())
+          .await
+        {
+          location_links.push(link);
+        }
+      }
+      Some(lsp::GotoDefinitionResponse::Link(location_links))
     } else {
       None
     }
@@ -449,18 +692,18 @@ pub struct DocumentHighlights {
 impl DocumentHighlights {
   pub fn to_highlight(
     &self,
-    line_index: &[u32],
-  ) -> Vec<lsp_types::DocumentHighlight> {
+    line_index: &LineIndex,
+  ) -> Vec<lsp::DocumentHighlight> {
     self
       .highlight_spans
       .iter()
-      .map(|hs| lsp_types::DocumentHighlight {
+      .map(|hs| lsp::DocumentHighlight {
         range: hs.text_span.to_range(line_index),
         kind: match hs.kind {
           HighlightSpanKind::WrittenReference => {
-            Some(lsp_types::DocumentHighlightKind::Write)
+            Some(lsp::DocumentHighlightKind::Write)
           }
-          _ => Some(lsp_types::DocumentHighlightKind::Read),
+          _ => Some(lsp::DocumentHighlightKind::Read),
         },
       })
       .collect()
@@ -473,20 +716,17 @@ pub struct ReferenceEntry {
   is_write_access: bool,
   pub is_definition: bool,
   is_in_string: Option<bool>,
-  text_span: TextSpan,
-  pub file_name: String,
-  original_text_span: Option<TextSpan>,
-  original_file_name: Option<String>,
-  context_span: Option<TextSpan>,
-  original_context_span: Option<TextSpan>,
+  #[serde(flatten)]
+  pub document_span: DocumentSpan,
 }
 
 impl ReferenceEntry {
-  pub fn to_location(&self, line_index: &[u32]) -> lsp_types::Location {
-    let uri = utils::normalize_file_name(&self.file_name).unwrap();
-    lsp_types::Location {
+  pub fn to_location(&self, line_index: &LineIndex) -> lsp::Location {
+    let uri =
+      utils::normalize_file_name(&self.document_span.file_name).unwrap();
+    lsp::Location {
       uri,
-      range: self.text_span.to_range(line_index),
+      range: self.document_span.text_span.to_range(line_index),
     }
   }
 }
@@ -501,14 +741,14 @@ pub struct CompletionInfo {
 impl CompletionInfo {
   pub fn into_completion_response(
     self,
-    line_index: &[u32],
-  ) -> lsp_types::CompletionResponse {
+    line_index: &LineIndex,
+  ) -> lsp::CompletionResponse {
     let items = self
       .entries
       .into_iter()
       .map(|entry| entry.into_completion_item(line_index))
       .collect();
-    lsp_types::CompletionResponse::Array(items)
+    lsp::CompletionResponse::Array(items)
   }
 }
 
@@ -529,9 +769,9 @@ pub struct CompletionEntry {
 impl CompletionEntry {
   pub fn into_completion_item(
     self,
-    line_index: &[u32],
-  ) -> lsp_types::CompletionItem {
-    let mut item = lsp_types::CompletionItem {
+    line_index: &LineIndex,
+  ) -> lsp::CompletionItem {
+    let mut item = lsp::CompletionItem {
       label: self.name,
       kind: Some(self.kind.into()),
       sort_text: Some(self.sort_text.clone()),
@@ -550,15 +790,15 @@ impl CompletionEntry {
     }
 
     match item.kind {
-      Some(lsp_types::CompletionItemKind::Function)
-      | Some(lsp_types::CompletionItemKind::Method) => {
-        item.insert_text_format = Some(lsp_types::InsertTextFormat::Snippet);
+      Some(lsp::CompletionItemKind::Function)
+      | Some(lsp::CompletionItemKind::Method) => {
+        item.insert_text_format = Some(lsp::InsertTextFormat::Snippet);
       }
       _ => {}
     }
 
     let mut insert_text = self.insert_text;
-    let replacement_range: Option<lsp_types::Range> =
+    let replacement_range: Option<lsp::Range> =
       self.replacement_span.map(|span| span.to_range(line_index));
 
     // TODO(lucacasonato): port other special cases from https://github.com/theia-ide/typescript-language-server/blob/fdf28313833cd6216d00eb4e04dc7f00f4c04f09/server/src/completion.ts#L49-L55
@@ -577,8 +817,8 @@ impl CompletionEntry {
 
     if let Some(insert_text) = insert_text {
       if let Some(replacement_range) = replacement_range {
-        item.text_edit = Some(lsp_types::CompletionTextEdit::Edit(
-          lsp_types::TextEdit::new(replacement_range, insert_text),
+        item.text_edit = Some(lsp::CompletionTextEdit::Edit(
+          lsp::TextEdit::new(replacement_range, insert_text),
         ));
       } else {
         item.insert_text = Some(insert_text);
@@ -599,17 +839,17 @@ struct State<'a> {
   asset: Option<String>,
   last_id: usize,
   response: Option<Response>,
-  server_state: ServerStateSnapshot,
+  state_snapshot: StateSnapshot,
   snapshots: HashMap<(Cow<'a, str>, Cow<'a, str>), String>,
 }
 
 impl<'a> State<'a> {
-  fn new(server_state: ServerStateSnapshot) -> Self {
+  fn new(state_snapshot: StateSnapshot) -> Self {
     Self {
       asset: None,
       last_id: 1,
       response: None,
-      server_state,
+      state_snapshot,
       snapshots: Default::default(),
     }
   }
@@ -626,9 +866,7 @@ fn cache_snapshot(
     .contains_key(&(specifier.clone().into(), version.clone().into()))
   {
     let s = ModuleSpecifier::resolve_url(&specifier)?;
-    let file_cache = state.server_state.file_cache.read().unwrap();
-    let file_id = file_cache.lookup(&s).unwrap();
-    let content = file_cache.get_contents(file_id)?;
+    let content = state.state_snapshot.documents.content(&s)?.unwrap();
     state
       .snapshots
       .insert((specifier.into(), version.into()), content);
@@ -696,7 +934,7 @@ fn get_change_range(state: &mut State, args: Value) -> Result<Value, AnyError> {
           "start": 0,
           "length": v.old_length,
         },
-        "newLength": current.chars().count(),
+        "newLength": current.encode_utf16().count(),
       }))
     }
   } else {
@@ -713,16 +951,16 @@ fn get_change_range(state: &mut State, args: Value) -> Result<Value, AnyError> {
 fn get_length(state: &mut State, args: Value) -> Result<Value, AnyError> {
   let v: SourceSnapshotArgs = serde_json::from_value(args)?;
   let specifier = ModuleSpecifier::resolve_url(&v.specifier)?;
-  if state.server_state.doc_data.contains_key(&specifier) {
+  if state.state_snapshot.documents.contains(&specifier) {
     cache_snapshot(state, v.specifier.clone(), v.version.clone())?;
     let content = state
       .snapshots
       .get(&(v.specifier.into(), v.version.into()))
       .unwrap();
-    Ok(json!(content.chars().count()))
+    Ok(json!(content.encode_utf16().count()))
   } else {
-    let mut sources = state.server_state.sources.write().unwrap();
-    Ok(json!(sources.get_length(&specifier).unwrap()))
+    let sources = &state.state_snapshot.sources;
+    Ok(json!(sources.get_length_utf16(&specifier).unwrap()))
   }
 }
 
@@ -738,7 +976,7 @@ struct GetTextArgs {
 fn get_text(state: &mut State, args: Value) -> Result<Value, AnyError> {
   let v: GetTextArgs = serde_json::from_value(args)?;
   let specifier = ModuleSpecifier::resolve_url(&v.specifier)?;
-  let content = if state.server_state.doc_data.contains_key(&specifier) {
+  let content = if state.state_snapshot.documents.contains(&specifier) {
     cache_snapshot(state, v.specifier.clone(), v.version.clone())?;
     state
       .snapshots
@@ -746,7 +984,7 @@ fn get_text(state: &mut State, args: Value) -> Result<Value, AnyError> {
       .unwrap()
       .clone()
   } else {
-    let mut sources = state.server_state.sources.write().unwrap();
+    let sources = &state.state_snapshot.sources;
     sources.get_text(&specifier).unwrap()
   };
   Ok(json!(text::slice(&content, v.start..v.end)))
@@ -756,14 +994,12 @@ fn resolve(state: &mut State, args: Value) -> Result<Value, AnyError> {
   let v: ResolveArgs = serde_json::from_value(args)?;
   let mut resolved = Vec::<Option<(String, String)>>::new();
   let referrer = ModuleSpecifier::resolve_url(&v.base)?;
-  let mut sources = if let Ok(sources) = state.server_state.sources.write() {
-    sources
-  } else {
-    return Err(custom_error("Deadlock", "deadlock locking sources"));
-  };
+  let sources = &state.state_snapshot.sources;
 
-  if let Some(doc_data) = state.server_state.doc_data.get(&referrer) {
-    if let Some(dependencies) = &doc_data.dependencies {
+  if state.state_snapshot.documents.contains(&referrer) {
+    if let Some(dependencies) =
+      state.state_snapshot.documents.dependencies(&referrer)
+    {
       for specifier in &v.specifiers {
         if specifier.starts_with("asset:///") {
           resolved.push(Some((
@@ -777,14 +1013,12 @@ fn resolve(state: &mut State, args: Value) -> Result<Value, AnyError> {
             } else if let Some(resolved_import) = &dependency.maybe_code {
               resolved_import.clone()
             } else {
-              ResolvedImport::Err("missing dependency".to_string())
+              ResolvedDependency::Err("missing dependency".to_string())
             };
-          if let ResolvedImport::Resolved(resolved_specifier) = resolved_import
+          if let ResolvedDependency::Resolved(resolved_specifier) =
+            resolved_import
           {
-            if state
-              .server_state
-              .doc_data
-              .contains_key(&resolved_specifier)
+            if state.state_snapshot.documents.contains(&resolved_specifier)
               || sources.contains(&resolved_specifier)
             {
               let media_type = if let Some(media_type) =
@@ -823,7 +1057,10 @@ fn resolve(state: &mut State, args: Value) -> Result<Value, AnyError> {
   } else {
     return Err(custom_error(
       "NotFound",
-      "the referring specifier is unexpectedly missing",
+      format!(
+        "the referring ({}) specifier is unexpectedly missing",
+        referrer
+      ),
     ));
   }
 
@@ -836,9 +1073,7 @@ fn respond(state: &mut State, args: Value) -> Result<Value, AnyError> {
 }
 
 fn script_names(state: &mut State, _args: Value) -> Result<Value, AnyError> {
-  let script_names: Vec<&ModuleSpecifier> =
-    state.server_state.doc_data.keys().collect();
-  Ok(json!(script_names))
+  Ok(json!(state.state_snapshot.documents.open_specifiers()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -850,13 +1085,10 @@ struct ScriptVersionArgs {
 fn script_version(state: &mut State, args: Value) -> Result<Value, AnyError> {
   let v: ScriptVersionArgs = serde_json::from_value(args)?;
   let specifier = ModuleSpecifier::resolve_url(&v.specifier)?;
-  let maybe_doc_data = state.server_state.doc_data.get(&specifier);
-  if let Some(doc_data) = maybe_doc_data {
-    if let Some(version) = doc_data.version {
-      return Ok(json!(version.to_string()));
-    }
+  if let Some(version) = state.state_snapshot.documents.version(&specifier) {
+    return Ok(json!(version.to_string()));
   } else {
-    let mut sources = state.server_state.sources.write().unwrap();
+    let sources = &state.state_snapshot.sources;
     if let Some(version) = sources.get_script_version(&specifier) {
       return Ok(json!(version));
     }
@@ -882,14 +1114,14 @@ fn set_asset(state: &mut State, args: Value) -> Result<Value, AnyError> {
 /// server.
 pub fn start(debug: bool) -> Result<JsRuntime, AnyError> {
   let mut runtime = JsRuntime::new(RuntimeOptions {
-    startup_snapshot: Some(js::compiler_isolate_init()),
+    startup_snapshot: Some(tsc::compiler_snapshot()),
     ..Default::default()
   });
 
   {
     let op_state = runtime.op_state();
     let mut op_state = op_state.borrow_mut();
-    op_state.put(State::new(ServerStateSnapshot::default()));
+    op_state.put(State::new(StateSnapshot::default()));
   }
 
   runtime.register_op("op_dispose", op(dispose));
@@ -975,27 +1207,30 @@ pub struct UserPreferences {
 }
 
 /// Methods that are supported by the Language Service in the compiler isolate.
+#[derive(Debug)]
 pub enum RequestMethod {
   /// Configure the compilation settings for the server.
   Configure(TsConfig),
+  /// Get rename locations at a given position.
+  FindRenameLocations((ModuleSpecifier, u32, bool, bool, bool)),
   /// Retrieve the text of an assets that exists in memory in the isolate.
   GetAsset(ModuleSpecifier),
-  /// Return semantic diagnostics for given file.
-  GetSemanticDiagnostics(ModuleSpecifier),
-  /// Returns suggestion diagnostics for given file.
-  GetSuggestionDiagnostics(ModuleSpecifier),
-  /// Return syntactic diagnostics for a given file.
-  GetSyntacticDiagnostics(ModuleSpecifier),
-  /// Return quick info at position (hover information).
-  GetQuickInfo((ModuleSpecifier, u32)),
-  /// Return document highlights at position.
-  GetDocumentHighlights((ModuleSpecifier, u32, Vec<ModuleSpecifier>)),
-  /// Get document references for a specific position.
-  GetReferences((ModuleSpecifier, u32)),
-  /// Get declaration information for a specific position.
-  GetDefinition((ModuleSpecifier, u32)),
   /// Get completion information at a given position (IntelliSense).
   GetCompletions((ModuleSpecifier, u32, UserPreferences)),
+  /// Get declaration information for a specific position.
+  GetDefinition((ModuleSpecifier, u32)),
+  /// Return diagnostics for given file.
+  GetDiagnostics(Vec<ModuleSpecifier>),
+  /// Return document highlights at position.
+  GetDocumentHighlights((ModuleSpecifier, u32, Vec<ModuleSpecifier>)),
+  /// Get implementation information for a specific position.
+  GetImplementation((ModuleSpecifier, u32)),
+  /// Get a "navigation tree" for a specifier.
+  GetNavigationTree(ModuleSpecifier),
+  /// Return quick info at position (hover information).
+  GetQuickInfo((ModuleSpecifier, u32)),
+  /// Get document references for a specific position.
+  GetReferences((ModuleSpecifier, u32)),
 }
 
 impl RequestMethod {
@@ -1006,31 +1241,47 @@ impl RequestMethod {
         "method": "configure",
         "compilerOptions": config,
       }),
+      RequestMethod::FindRenameLocations((
+        specifier,
+        position,
+        find_in_strings,
+        find_in_comments,
+        provide_prefix_and_suffix_text_for_rename,
+      )) => {
+        json!({
+          "id": id,
+          "method": "findRenameLocations",
+          "specifier": specifier,
+          "position": position,
+          "findInStrings": find_in_strings,
+          "findInComments": find_in_comments,
+          "providePrefixAndSuffixTextForRename": provide_prefix_and_suffix_text_for_rename
+        })
+      }
       RequestMethod::GetAsset(specifier) => json!({
         "id": id,
         "method": "getAsset",
         "specifier": specifier,
       }),
-      RequestMethod::GetSemanticDiagnostics(specifier) => json!({
+      RequestMethod::GetCompletions((specifier, position, preferences)) => {
+        json!({
+          "id": id,
+          "method": "getCompletions",
+          "specifier": specifier,
+          "position": position,
+          "preferences": preferences,
+        })
+      }
+      RequestMethod::GetDefinition((specifier, position)) => json!({
         "id": id,
-        "method": "getSemanticDiagnostics",
-        "specifier": specifier,
-      }),
-      RequestMethod::GetSuggestionDiagnostics(specifier) => json!({
-        "id": id,
-        "method": "getSuggestionDiagnostics",
-        "specifier": specifier,
-      }),
-      RequestMethod::GetSyntacticDiagnostics(specifier) => json!({
-        "id": id,
-        "method": "getSyntacticDiagnostics",
-        "specifier": specifier,
-      }),
-      RequestMethod::GetQuickInfo((specifier, position)) => json!({
-        "id": id,
-        "method": "getQuickInfo",
+        "method": "getDefinition",
         "specifier": specifier,
         "position": position,
+      }),
+      RequestMethod::GetDiagnostics(specifiers) => json!({
+        "id": id,
+        "method": "getDiagnostics",
+        "specifiers": specifiers,
       }),
       RequestMethod::GetDocumentHighlights((
         specifier,
@@ -1043,27 +1294,29 @@ impl RequestMethod {
         "position": position,
         "filesToSearch": files_to_search,
       }),
+      RequestMethod::GetImplementation((specifier, position)) => json!({
+        "id": id,
+        "method": "getImplementation",
+        "specifier": specifier,
+        "position": position,
+      }),
+      RequestMethod::GetNavigationTree(specifier) => json!({
+        "id": id,
+        "method": "getNavigationTree",
+        "specifier": specifier,
+      }),
+      RequestMethod::GetQuickInfo((specifier, position)) => json!({
+        "id": id,
+        "method": "getQuickInfo",
+        "specifier": specifier,
+        "position": position,
+      }),
       RequestMethod::GetReferences((specifier, position)) => json!({
         "id": id,
         "method": "getReferences",
         "specifier": specifier,
         "position": position,
       }),
-      RequestMethod::GetDefinition((specifier, position)) => json!({
-        "id": id,
-        "method": "getDefinition",
-        "specifier": specifier,
-        "position": position,
-      }),
-      RequestMethod::GetCompletions((specifier, position, preferences)) => {
-        json!({
-          "id": id,
-          "method": "getCompletions",
-          "specifier": specifier,
-          "position": position,
-          "preferences": preferences,
-        })
-      }
     }
   }
 }
@@ -1071,14 +1324,14 @@ impl RequestMethod {
 /// Send a request into a runtime and return the JSON value of the response.
 pub fn request(
   runtime: &mut JsRuntime,
-  server_state: &ServerStateSnapshot,
+  state_snapshot: StateSnapshot,
   method: RequestMethod,
 ) -> Result<Value, AnyError> {
   let id = {
     let op_state = runtime.op_state();
     let mut op_state = op_state.borrow_mut();
     let state = op_state.borrow_mut::<State>();
-    state.server_state = server_state.clone();
+    state.state_snapshot = state_snapshot;
     state.last_id += 1;
     state.last_id
   };
@@ -1101,58 +1354,21 @@ pub fn request(
   }
 }
 
-fn request_asset(
-  specifier: &ModuleSpecifier,
-  runtime: &mut JsRuntime,
-  server_state: &ServerStateSnapshot,
-) -> Result<Option<String>, AnyError> {
-  let id = {
-    let op_state = runtime.op_state();
-    let mut op_state = op_state.borrow_mut();
-    let state = op_state.borrow_mut::<State>();
-    state.server_state = server_state.clone();
-    state.last_id += 1;
-    state.last_id
-  };
-  let request_params = RequestMethod::GetAsset(specifier.clone()).to_value(id);
-  let request_src = format!("globalThis.serverRequest({});", request_params);
-  runtime.execute("[native_code]", &request_src)?;
-
-  let op_state = runtime.op_state();
-  let mut op_state = op_state.borrow_mut();
-  let state = op_state.borrow_mut::<State>();
-
-  Ok(state.asset.clone())
-}
-
 #[cfg(test)]
 mod tests {
-  use super::super::memory_cache::MemoryCache;
-  use super::super::state::DocumentData;
   use super::*;
-  use std::collections::HashMap;
-  use std::sync::Arc;
-  use std::sync::RwLock;
+  use crate::lsp::documents::DocumentCache;
 
-  fn mock_server_state(sources: Vec<(&str, &str, i32)>) -> ServerStateSnapshot {
-    let mut doc_data = HashMap::new();
-    let mut file_cache = MemoryCache::default();
+  fn mock_state_snapshot(sources: Vec<(&str, &str, i32)>) -> StateSnapshot {
+    let mut documents = DocumentCache::default();
     for (specifier, content, version) in sources {
       let specifier = ModuleSpecifier::resolve_url(specifier)
         .expect("failed to create specifier");
-      doc_data.insert(
-        specifier.clone(),
-        DocumentData::new(specifier.clone(), version, content, None),
-      );
-      file_cache.set_contents(specifier, Some(content.as_bytes().to_vec()));
+      documents.open(specifier, version, content.to_string());
     }
-    let file_cache = Arc::new(RwLock::new(file_cache));
-    ServerStateSnapshot {
+    StateSnapshot {
       assets: Default::default(),
-      config: Default::default(),
-      diagnostics: Default::default(),
-      doc_data,
-      file_cache,
+      documents,
       sources: Default::default(),
     }
   }
@@ -1161,20 +1377,20 @@ mod tests {
     debug: bool,
     config: Value,
     sources: Vec<(&str, &str, i32)>,
-  ) -> (JsRuntime, ServerStateSnapshot) {
-    let server_state = mock_server_state(sources.clone());
+  ) -> (JsRuntime, StateSnapshot) {
+    let state_snapshot = mock_state_snapshot(sources.clone());
     let mut runtime = start(debug).expect("could not start server");
     let ts_config = TsConfig::new(config);
     assert_eq!(
       request(
         &mut runtime,
-        &server_state,
+        state_snapshot.clone(),
         RequestMethod::Configure(ts_config)
       )
       .expect("failed request"),
       json!(true)
     );
-    (runtime, server_state)
+    (runtime, state_snapshot)
   }
 
   #[test]
@@ -1207,7 +1423,7 @@ mod tests {
 
   #[test]
   fn test_project_reconfigure() {
-    let (mut runtime, server_state) = setup(
+    let (mut runtime, state_snapshot) = setup(
       false,
       json!({
         "target": "esnext",
@@ -1224,7 +1440,7 @@ mod tests {
     }));
     let result = request(
       &mut runtime,
-      &server_state,
+      state_snapshot,
       RequestMethod::Configure(ts_config),
     );
     assert!(result.is_ok());
@@ -1233,8 +1449,8 @@ mod tests {
   }
 
   #[test]
-  fn test_get_semantic_diagnostics() {
-    let (mut runtime, server_state) = setup(
+  fn test_get_diagnostics() {
+    let (mut runtime, state_snapshot) = setup(
       false,
       json!({
         "target": "esnext",
@@ -1247,36 +1463,38 @@ mod tests {
       .expect("could not resolve url");
     let result = request(
       &mut runtime,
-      &server_state,
-      RequestMethod::GetSemanticDiagnostics(specifier),
+      state_snapshot,
+      RequestMethod::GetDiagnostics(vec![specifier]),
     );
     assert!(result.is_ok());
     let response = result.unwrap();
     assert_eq!(
       response,
-      json!([
-        {
-          "start": {
-            "line": 0,
-            "character": 0,
-          },
-          "end": {
-            "line": 0,
-            "character": 7
-          },
-          "fileName": "file:///a.ts",
-          "messageText": "Cannot find name 'console'. Do you need to change your target library? Try changing the `lib` compiler option to include 'dom'.",
-          "sourceLine": "console.log(\"hello deno\");",
-          "category": 1,
-          "code": 2584
-        }
-      ])
+      json!({
+        "file:///a.ts": [
+          {
+            "start": {
+              "line": 0,
+              "character": 0,
+            },
+            "end": {
+              "line": 0,
+              "character": 7
+            },
+            "fileName": "file:///a.ts",
+            "messageText": "Cannot find name 'console'. Do you need to change your target library? Try changing the `lib` compiler option to include 'dom'.",
+            "sourceLine": "console.log(\"hello deno\");",
+            "category": 1,
+            "code": 2584
+          }
+        ]
+      })
     );
   }
 
   #[test]
   fn test_module_resolution() {
-    let (mut runtime, server_state) = setup(
+    let (mut runtime, state_snapshot) = setup(
       false,
       json!({
         "target": "esnext",
@@ -1300,17 +1518,17 @@ mod tests {
       .expect("could not resolve url");
     let result = request(
       &mut runtime,
-      &server_state,
-      RequestMethod::GetSemanticDiagnostics(specifier),
+      state_snapshot,
+      RequestMethod::GetDiagnostics(vec![specifier]),
     );
     assert!(result.is_ok());
     let response = result.unwrap();
-    assert_eq!(response, json!([]));
+    assert_eq!(response, json!({ "file:///a.ts": [] }));
   }
 
   #[test]
   fn test_bad_module_specifiers() {
-    let (mut runtime, server_state) = setup(
+    let (mut runtime, state_snapshot) = setup(
       false,
       json!({
         "target": "esnext",
@@ -1330,17 +1548,37 @@ mod tests {
       .expect("could not resolve url");
     let result = request(
       &mut runtime,
-      &server_state,
-      RequestMethod::GetSyntacticDiagnostics(specifier),
+      state_snapshot,
+      RequestMethod::GetDiagnostics(vec![specifier]),
     );
     assert!(result.is_ok());
     let response = result.unwrap();
-    assert_eq!(response, json!([]));
+    assert_eq!(
+      response,
+      json!({
+        "file:///a.ts": [{
+          "start": {
+            "line": 1,
+            "character": 8
+          },
+          "end": {
+            "line": 1,
+            "character": 30
+          },
+          "fileName": "file:///a.ts",
+          "messageText": "\'A\' is declared but its value is never read.",
+          "sourceLine": "        import { A } from \".\";",
+          "category": 2,
+          "code": 6133,
+          "reportsUnnecessary": true,
+        }]
+      })
+    );
   }
 
   #[test]
   fn test_remote_modules() {
-    let (mut runtime, server_state) = setup(
+    let (mut runtime, state_snapshot) = setup(
       false,
       json!({
         "target": "esnext",
@@ -1364,17 +1602,17 @@ mod tests {
       .expect("could not resolve url");
     let result = request(
       &mut runtime,
-      &server_state,
-      RequestMethod::GetSyntacticDiagnostics(specifier),
+      state_snapshot,
+      RequestMethod::GetDiagnostics(vec![specifier]),
     );
     assert!(result.is_ok());
     let response = result.unwrap();
-    assert_eq!(response, json!([]));
+    assert_eq!(response, json!({ "file:///a.ts": [] }));
   }
 
   #[test]
   fn test_partial_modules() {
-    let (mut runtime, server_state) = setup(
+    let (mut runtime, state_snapshot) = setup(
       false,
       json!({
         "target": "esnext",
@@ -1391,7 +1629,7 @@ mod tests {
           Router,
           Status,
         } from "https://deno.land/x/oak@v6.3.2/mod.ts";
-        
+
         import * as test from
       "#,
         1,
@@ -1401,34 +1639,75 @@ mod tests {
       .expect("could not resolve url");
     let result = request(
       &mut runtime,
-      &server_state,
-      RequestMethod::GetSyntacticDiagnostics(specifier),
+      state_snapshot,
+      RequestMethod::GetDiagnostics(vec![specifier]),
     );
     assert!(result.is_ok());
     let response = result.unwrap();
     assert_eq!(
       response,
-      json!([{
-        "start": {
-          "line": 8,
-          "character": 29
-        },
-        "end": {
-          "line": 8,
-          "character": 29
-        },
-        "fileName": "file:///a.ts",
-        "messageText": "Expression expected.",
-        "sourceLine": "        import * as test from",
-        "category": 1,
-        "code": 1109
-      }])
+      json!({
+        "file:///a.ts": [{
+          "start": {
+            "line": 1,
+            "character": 8
+          },
+          "end": {
+            "line": 6,
+            "character": 55,
+          },
+          "fileName": "file:///a.ts",
+          "messageText": "All imports in import declaration are unused.",
+          "sourceLine": "        import {",
+          "category": 2,
+          "code": 6192,
+          "reportsUnnecessary": true
+        }, {
+          "start": {
+            "line": 8,
+            "character": 29
+          },
+          "end": {
+            "line": 8,
+            "character": 29
+          },
+          "fileName": "file:///a.ts",
+          "messageText": "Expression expected.",
+          "sourceLine": "        import * as test from",
+          "category": 1,
+          "code": 1109
+        }]
+      })
     );
   }
 
   #[test]
+  fn test_no_debug_failure() {
+    let (mut runtime, state_snapshot) = setup(
+      false,
+      json!({
+        "target": "esnext",
+        "module": "esnext",
+        "lib": ["deno.ns", "deno.window"],
+        "noEmit": true,
+      }),
+      vec![("file:///a.ts", r#"const url = new URL("b.js", import."#, 1)],
+    );
+    let specifier = ModuleSpecifier::resolve_url("file:///a.ts")
+      .expect("could not resolve url");
+    let result = request(
+      &mut runtime,
+      state_snapshot,
+      RequestMethod::GetDiagnostics(vec![specifier]),
+    );
+    assert!(result.is_ok());
+    let response = result.unwrap();
+    assert_eq!(response, json!({}));
+  }
+
+  #[test]
   fn test_request_asset() {
-    let (mut runtime, server_state) = setup(
+    let (mut runtime, state_snapshot) = setup(
       false,
       json!({
         "target": "esnext",
@@ -1440,9 +1719,14 @@ mod tests {
     );
     let specifier = ModuleSpecifier::resolve_url("asset:///lib.esnext.d.ts")
       .expect("could not resolve url");
-    let result = request_asset(&specifier, &mut runtime, &server_state);
+    let result = request(
+      &mut runtime,
+      state_snapshot,
+      RequestMethod::GetAsset(specifier),
+    );
     assert!(result.is_ok());
-    let response = result.unwrap();
+    let response: Option<String> =
+      serde_json::from_value(result.unwrap()).unwrap();
     assert!(response.is_some());
   }
 }

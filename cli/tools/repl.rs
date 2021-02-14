@@ -438,6 +438,8 @@ pub async fn run(
 
   inject_prelude(&mut worker, &mut session, context_id).await?;
 
+  let mut close_on_next_interrupt = false;
+
   loop {
     let line = read_line_and_poll(
       &mut worker,
@@ -449,6 +451,8 @@ pub async fn run(
     .await;
     match line {
       Ok(line) => {
+        close_on_next_interrupt = false;
+
         // It is a bit unexpected that { "foo": "bar" } is interpreted as a block
         // statement rather than an object literal so we interpret it as an expression statement
         // to match the behavior found in a typical prompt including browser developer tools.
@@ -561,6 +565,11 @@ pub async fn run(
         editor.lock().unwrap().add_history_entry(line.as_str());
       }
       Err(ReadlineError::Interrupted) => {
+        if close_on_next_interrupt {
+            break;
+        }
+
+        close_on_next_interrupt = true;
         println!("exit using ctrl+d or close()");
         continue;
       }

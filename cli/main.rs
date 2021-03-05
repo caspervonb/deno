@@ -1,6 +1,6 @@
 // Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
 
-#![deny(warnings)]
+// #![deny(warnings)]
 
 #[macro_use]
 extern crate lazy_static;
@@ -218,6 +218,7 @@ pub fn create_main_worker(
     // above
     ops::errors::init(js_runtime);
     ops::runtime_compiler::init(js_runtime);
+    ops::test_runner::init(js_runtime);
   }
   worker.bootstrap(&options);
 
@@ -918,6 +919,7 @@ async fn test_command(
     }
     return Ok(());
   }
+
   let main_module = deno_core::resolve_path("$deno$test.ts")?;
   // Create a dummy source file.
   let source_file = File {
@@ -957,33 +959,10 @@ async fn test_command(
   let mut worker =
     create_main_worker(&program_state, main_module.clone(), permissions);
 
-  if let Some(ref coverage_dir) = flags.coverage_dir {
-    env::set_var("DENO_UNSTABLE_COVERAGE_DIR", coverage_dir);
-  }
-
-  let mut maybe_coverage_collector =
-    if let Some(ref coverage_dir) = program_state.coverage_dir {
-      let session = worker.create_inspector_session();
-      let coverage_dir = PathBuf::from(coverage_dir);
-      let mut coverage_collector =
-        tools::coverage::CoverageCollector::new(coverage_dir, session);
-      coverage_collector.start_collecting().await?;
-
-      Some(coverage_collector)
-    } else {
-      None
-    };
-
   let execute_result = worker.execute_module(&main_module).await;
   execute_result?;
-  worker.execute("window.dispatchEvent(new Event('load'))")?;
+  worker.execute("Deno[Deno.internal].runTests()")?;
   worker.run_event_loop().await?;
-  worker.execute("window.dispatchEvent(new Event('unload'))")?;
-  worker.run_event_loop().await?;
-
-  if let Some(coverage_collector) = maybe_coverage_collector.as_mut() {
-    coverage_collector.stop_collecting().await?;
-  }
 
   Ok(())
 }

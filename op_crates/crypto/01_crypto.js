@@ -125,24 +125,6 @@
   }
 
   const subtle = {
-    async decrypt(algorithm, key, data) {
-      await Promise.resolve();
-      throw new Error("Not implemented");
-    },
-    async deriveBits(algorithm, baseKey, length) {
-      await Promise.resolve();
-      throw new Error("Not implemented");
-    },
-    async deriveKey(
-      algorithm,
-      baseKey,
-      derivedKeyType,
-      extractable,
-      keyUsages,
-    ) {
-      await Promise.resolve();
-      throw new Error("Not implemented");
-    },
     async digest(algorithm, data) {
       let input;
       if (data instanceof ArrayBuffer) {
@@ -164,46 +146,6 @@
         new Uint8Array(output, 0, output.byteLength),
       );
       return output;
-    },
-    async encrypt(algorithm, key, data) {
-      await Promise.resolve();
-      throw new Error("Not implemented");
-    },
-    async exportKey(format, key) {
-      await Promise.resolve();
-      throw new Error("Not implemented");
-    },
-    async generateKey(algorithm, extractable, keyUsages) {
-      await Promise.resolve();
-      throw new Error("Not implemented");
-    },
-    async importKey(format, keyData, algorithm, extractable, keyUsages) {
-      await Promise.resolve();
-      throw new Error("Not implemented");
-    },
-    async sign(algorithm, key, data) {
-      await Promise.resolve();
-      throw new Error("Not implemented");
-    },
-    async unwrapKey(
-      format,
-      wrappedKey,
-      unwrappingKey,
-      unwrapAlgorithm,
-      unwrappedKeyAlgorithm,
-      extractable,
-      keyUsages,
-    ) {
-      await Promise.resolve();
-      throw new Error("Not implemented");
-    },
-    async verify(algorithm, key, signature, data) {
-      await Promise.resolve();
-      throw new Error("Not implemented");
-    },
-    async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
-      await Promise.resolve();
-      throw new Error("Not implemented");
     },
   };
 

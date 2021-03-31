@@ -6,6 +6,8 @@
 /// <reference lib="esnext" />
 
 declare interface Crypto {
+
+declare interface Crypto {
   readonly subtle: SubtleCrypto;
   getRandomValues<
     T extends

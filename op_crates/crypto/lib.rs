@@ -2,8 +2,8 @@
 
 #![deny(warnings)]
 
-use deno_core::serde::Deserialize;
 use deno_core::error::AnyError;
+use deno_core::serde::Deserialize;
 use deno_core::serde_json::json;
 use deno_core::serde_json::Value;
 use deno_core::BufVec;
@@ -88,7 +88,8 @@ pub async fn op_crypto_subtle_digest(
     // This asserts that the anticipated length is equal to the actual length.
     assert_eq!(digest.algorithm().output_len, zc[1].as_ref().len());
     zc[1].copy_from_slice(digest.as_ref());
-  }).await?;
+  })
+  .await?;
 
   Ok(Value::Null)
 }

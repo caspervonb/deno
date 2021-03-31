@@ -1,10 +1,6 @@
 // Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
 // Usage: provide a port as argument to run hyper_hello benchmark server
 // otherwise this starts multiple servers on many ports for test endpoints.
-
-#[macro_use]
-extern crate lazy_static;
-
 use futures::FutureExt;
 use futures::Stream;
 use futures::StreamExt;
@@ -16,9 +12,8 @@ use hyper::Body;
 use hyper::Request;
 use hyper::Response;
 use hyper::StatusCode;
+use lazy_static::lazy_static;
 use os_pipe::pipe;
-#[cfg(unix)]
-pub use pty;
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -48,6 +43,9 @@ use tokio_rustls::rustls;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_async;
 
+#[cfg(unix)]
+pub use pty;
+
 const PORT: u16 = 4545;
 const TEST_AUTH_TOKEN: &str = "abcdef123456789";
 const REDIRECT_PORT: u16 = 4546;
@@ -59,6 +57,7 @@ const AUTH_REDIRECT_PORT: u16 = 4551;
 const HTTPS_PORT: u16 = 5545;
 const WS_PORT: u16 = 4242;
 const WSS_PORT: u16 = 4243;
+const WS_CLOSE_PORT: u16 = 4244;
 
 pub const PERMISSION_VARIANTS: [&str; 5] =
   ["read", "write", "env", "net", "run"];
@@ -238,6 +237,20 @@ async fn run_ws_server(addr: &SocketAddr) {
             }
           })
           .await;
+      }
+    });
+  }
+}
+
+async fn run_ws_close_server(addr: &SocketAddr) {
+  let listener = TcpListener::bind(addr).await.unwrap();
+  while let Ok((stream, _addr)) = listener.accept().await {
+    tokio::spawn(async move {
+      let ws_stream_fut = accept_async(stream);
+
+      let ws_stream = ws_stream_fut.await;
+      if let Ok(mut ws_stream) = ws_stream {
+        ws_stream.close(None).await.unwrap();
       }
     });
   }
@@ -781,6 +794,8 @@ pub async fn run_all_servers() {
   let ws_server_fut = run_ws_server(&ws_addr);
   let wss_addr = SocketAddr::from(([127, 0, 0, 1], WSS_PORT));
   let wss_server_fut = run_wss_server(&wss_addr);
+  let ws_close_addr = SocketAddr::from(([127, 0, 0, 1], WS_CLOSE_PORT));
+  let ws_close_server_fut = run_ws_close_server(&ws_close_addr);
 
   let main_server_fut = wrap_main_server();
   let main_server_https_fut = wrap_main_https_server();
@@ -790,6 +805,7 @@ pub async fn run_all_servers() {
       redirect_server_fut,
       ws_server_fut,
       wss_server_fut,
+      ws_close_server_fut,
       another_redirect_server_fut,
       auth_redirect_server_fut,
       inf_redirects_server_fut,
@@ -946,7 +962,7 @@ impl HttpServerCount {
             break;
           }
         } else {
-          panic!(maybe_line.unwrap_err());
+          panic!("{}", maybe_line.unwrap_err());
         }
       }
       self.test_server = Some(test_server);
@@ -1133,11 +1149,15 @@ pub fn new_deno_dir() -> TempDir {
 }
 
 pub fn deno_cmd() -> Command {
-  let e = deno_exe_path();
   let deno_dir = new_deno_dir();
+  deno_cmd_with_deno_dir(deno_dir.path())
+}
+
+pub fn deno_cmd_with_deno_dir(deno_dir: &std::path::Path) -> Command {
+  let e = deno_exe_path();
   assert!(e.exists());
   let mut c = Command::new(e);
-  c.env("DENO_DIR", deno_dir.path());
+  c.env("DENO_DIR", deno_dir);
   c
 }
 

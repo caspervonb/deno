@@ -2,13 +2,13 @@
 
 use crate::fs_util::canonicalize_path;
 use deno_core::error::AnyError;
+use deno_core::serde::Deserialize;
+use deno_core::serde::Serialize;
+use deno_core::serde::Serializer;
 use deno_core::serde_json;
 use deno_core::serde_json::json;
 use deno_core::serde_json::Value;
 use jsonc_parser::JsonValue;
-use serde::Deserialize;
-use serde::Serialize;
-use serde::Serializer;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
@@ -23,6 +23,7 @@ use std::str::FromStr;
 pub struct EmitConfigOptions {
   pub check_js: bool,
   pub emit_decorator_metadata: bool,
+  pub imports_not_used_as_values: String,
   pub inline_source_map: bool,
   pub jsx: String,
   pub jsx_factory: String,
@@ -174,7 +175,7 @@ fn jsonc_to_serde(j: JsonValue) -> Value {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TSConfigJson {
+struct TsConfigJson {
   compiler_options: Option<HashMap<String, Value>>,
   exclude: Option<Vec<String>>,
   extends: Option<String>,
@@ -220,7 +221,7 @@ pub fn parse_config(
 ) -> Result<(Value, Option<IgnoredCompilerOptions>), AnyError> {
   assert!(!config_text.is_empty());
   let jsonc = jsonc_parser::parse_to_value(config_text)?.unwrap();
-  let config: TSConfigJson = serde_json::from_value(jsonc_to_serde(jsonc))?;
+  let config: TsConfigJson = serde_json::from_value(jsonc_to_serde(jsonc))?;
 
   if let Some(compiler_options) = config.compiler_options {
     parse_compiler_options(&compiler_options, Some(path.to_owned()), false)

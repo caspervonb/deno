@@ -25,6 +25,8 @@ use deno_core::resolve_url;
 use deno_core::url::Url;
 use deno_core::ModuleSource;
 use deno_core::ModuleSpecifier;
+use log::debug;
+use log::warn;
 use std::collections::HashMap;
 use std::env;
 use std::fs::read;
@@ -96,9 +98,6 @@ impl ProgramState {
       match flags.import_map_path.as_ref() {
         None => None,
         Some(import_map_url) => {
-          if !flags.unstable {
-            exit_unstable("--import-map")
-          }
           let import_map_specifier =
             deno_core::resolve_url_or_path(&import_map_url).context(
               format!("Bad URL (\"{}\") for import map.", import_map_url),
@@ -113,13 +112,9 @@ impl ProgramState {
       };
 
     let maybe_inspect_host = flags.inspect.or(flags.inspect_brk);
-    let maybe_inspector_server = match maybe_inspect_host {
-      Some(host) => Some(Arc::new(InspectorServer::new(
-        host,
-        version::get_user_agent(),
-      ))),
-      None => None,
-    };
+    let maybe_inspector_server = maybe_inspect_host.map(|host| {
+      Arc::new(InspectorServer::new(host, version::get_user_agent()))
+    });
 
     let coverage_dir = flags
       .coverage_dir

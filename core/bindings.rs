@@ -9,14 +9,17 @@ use crate::OpTable;
 use crate::ZeroCopyBuf;
 use futures::future::FutureExt;
 use rusty_v8 as v8;
+use serde::Serialize;
+use serde_v8::to_v8;
 use std::cell::Cell;
 use std::convert::TryFrom;
+use std::convert::TryInto;
 use std::io::{stdout, Write};
 use std::option::Option;
 use url::Url;
 use v8::MapFnTo;
 
-lazy_static! {
+lazy_static::lazy_static! {
   pub static ref EXTERNAL_REFERENCES: v8::ExternalReferences =
     v8::ExternalReferences::new(&[
       v8::ExternalReference {
@@ -57,6 +60,9 @@ lazy_static! {
       },
       v8::ExternalReference {
         function: get_proxy_details.map_fn_to()
+      },
+      v8::ExternalReference {
+        function: heap_stats.map_fn_to(),
       },
     ]);
 }
@@ -134,6 +140,7 @@ pub fn initialize_context<'s>(
   set_func(scope, core_val, "deserialize", deserialize);
   set_func(scope, core_val, "getPromiseDetails", get_promise_details);
   set_func(scope, core_val, "getProxyDetails", get_proxy_details);
+  set_func(scope, core_val, "heapStats", heap_stats);
 
   let shared_key = v8::String::new(scope, "shared").unwrap();
   core_val.set_accessor(scope, shared_key.into(), shared_getter);
@@ -205,6 +212,32 @@ pub extern "C" fn host_import_module_dynamically_callback(
     state.dyn_import_cb(resolver_handle, &specifier_str, &referrer_name_str);
   }
 
+  // Map errors from module resolution (not JS errors from module execution) to
+  // ones rethrown from this scope, so they include the call stack of the
+  // dynamic import site. Error objects without any stack frames are assumed to
+  // be module resolution errors, other exception values are left as they are.
+  let map_err = |scope: &mut v8::HandleScope,
+                 args: v8::FunctionCallbackArguments,
+                 _rv: v8::ReturnValue| {
+    let arg = args.get(0);
+    if arg.is_native_error() {
+      let message = v8::Exception::create_message(scope, arg);
+      if message.get_stack_trace(scope).unwrap().get_frame_count() == 0 {
+        let arg: v8::Local<v8::Object> = arg.clone().try_into().unwrap();
+        let message_key = v8::String::new(scope, "message").unwrap();
+        let message = arg.get(scope, message_key.into()).unwrap();
+        let exception =
+          v8::Exception::type_error(scope, message.try_into().unwrap());
+        scope.throw_exception(exception);
+        return;
+      }
+    }
+    scope.throw_exception(arg);
+  };
+  let map_err = v8::FunctionTemplate::new(scope, map_err);
+  let map_err = map_err.get_function(scope).unwrap();
+  let promise = promise.catch(scope, map_err).unwrap();
+
   &*promise as *const _ as *mut _
 }
 
@@ -219,7 +252,7 @@ pub extern "C" fn host_initialize_import_meta_object_callback(
 
   let module_global = v8::Global::new(scope, module);
   let info = state
-    .modules
+    .module_map
     .get_info(&module_global)
     .expect("Module not found");
 
@@ -288,16 +321,19 @@ fn print(
   _rv: v8::ReturnValue,
 ) {
   let arg_len = args.length();
-  assert!((0..=2).contains(&arg_len));
+  if !(0..=2).contains(&arg_len) {
+    return throw_type_error(scope, "Expected a maximum of 2 arguments.");
+  }
 
   let obj = args.get(0);
   let is_err_arg = args.get(1);
 
   let mut is_err = false;
   if arg_len == 2 {
-    let int_val = is_err_arg
-      .integer_value(scope)
-      .expect("Unable to convert to integer");
+    let int_val = match is_err_arg.integer_value(scope) {
+      Some(v) => v,
+      None => return throw_type_error(scope, "Invalid arugment. Argument 2 should indicate wheter or not to print to stderr."),
+    };
     is_err = int_val != 0;
   };
   let tc_scope = &mut v8::TryCatch::new(scope);
@@ -341,7 +377,7 @@ fn send<'s>(
   mut rv: v8::ReturnValue,
 ) {
   let state_rc = JsRuntime::state(scope);
-  let state = state_rc.borrow_mut();
+  let mut state = state_rc.borrow_mut();
 
   let op_id = match v8::Local::<v8::Integer>::try_from(args.get(0))
     .map_err(AnyError::from)
@@ -385,12 +421,12 @@ fn send<'s>(
     Op::Async(fut) => {
       let fut2 = fut.map(move |buf| (op_id, buf));
       state.pending_ops.push(fut2.boxed_local());
-      state.have_unpolled_ops.set(true);
+      state.have_unpolled_ops = true;
     }
     Op::AsyncUnref(fut) => {
       let fut2 = fut.map(move |buf| (op_id, buf));
       state.pending_unref_ops.push(fut2.boxed_local());
-      state.have_unpolled_ops.set(true);
+      state.have_unpolled_ops = true;
     }
     Op::NotFound => {
       let msg = format!("Unknown op id: {}", op_id);
@@ -443,16 +479,17 @@ fn eval_context(
   let url = v8::Local::<v8::String>::try_from(args.get(1))
     .map(|n| Url::from_file_path(n.to_rust_string_lossy(scope)).unwrap());
 
-  let output = v8::Array::new(scope, 2);
-  /*
-   output[0] = result
-   output[1] = ErrorInfo | null
-     ErrorInfo = {
-       thrown: Error | any,
-       isNativeError: boolean,
-       isCompileError: boolean,
-     }
-  */
+  #[derive(Serialize)]
+  struct Output<'s>(Option<serde_v8::Value<'s>>, Option<ErrInfo<'s>>);
+
+  #[derive(Serialize)]
+  #[serde(rename_all = "camelCase")]
+  struct ErrInfo<'s> {
+    thrown: serde_v8::Value<'s>,
+    is_native_error: bool,
+    is_compile_error: bool,
+  }
+
   let tc_scope = &mut v8::TryCatch::new(scope);
   let name = v8::String::new(
     tc_scope,
@@ -465,39 +502,15 @@ fn eval_context(
   if maybe_script.is_none() {
     assert!(tc_scope.has_caught());
     let exception = tc_scope.exception().unwrap();
-
-    let js_zero = v8::Integer::new(tc_scope, 0);
-    let js_null = v8::null(tc_scope);
-    output.set(tc_scope, js_zero.into(), js_null.into());
-
-    let errinfo_obj = v8::Object::new(tc_scope);
-
-    let is_compile_error_key =
-      v8::String::new(tc_scope, "isCompileError").unwrap();
-    let is_compile_error_val = v8::Boolean::new(tc_scope, true);
-    errinfo_obj.set(
-      tc_scope,
-      is_compile_error_key.into(),
-      is_compile_error_val.into(),
+    let output = Output(
+      None,
+      Some(ErrInfo {
+        thrown: exception.into(),
+        is_native_error: exception.is_native_error(),
+        is_compile_error: true,
+      }),
     );
-
-    let is_native_error_key =
-      v8::String::new(tc_scope, "isNativeError").unwrap();
-    let is_native_error_val =
-      v8::Boolean::new(tc_scope, exception.is_native_error());
-    errinfo_obj.set(
-      tc_scope,
-      is_native_error_key.into(),
-      is_native_error_val.into(),
-    );
-
-    let thrown_key = v8::String::new(tc_scope, "thrown").unwrap();
-    errinfo_obj.set(tc_scope, thrown_key.into(), exception);
-
-    let js_one = v8::Integer::new(tc_scope, 1);
-    output.set(tc_scope, js_one.into(), errinfo_obj.into());
-
-    rv.set(output.into());
+    rv.set(to_v8(tc_scope, output).unwrap());
     return;
   }
 
@@ -506,48 +519,20 @@ fn eval_context(
   if result.is_none() {
     assert!(tc_scope.has_caught());
     let exception = tc_scope.exception().unwrap();
-
-    let js_zero = v8::Integer::new(tc_scope, 0);
-    let js_null = v8::null(tc_scope);
-    output.set(tc_scope, js_zero.into(), js_null.into());
-
-    let errinfo_obj = v8::Object::new(tc_scope);
-
-    let is_compile_error_key =
-      v8::String::new(tc_scope, "isCompileError").unwrap();
-    let is_compile_error_val = v8::Boolean::new(tc_scope, false);
-    errinfo_obj.set(
-      tc_scope,
-      is_compile_error_key.into(),
-      is_compile_error_val.into(),
+    let output = Output(
+      None,
+      Some(ErrInfo {
+        thrown: exception.into(),
+        is_native_error: exception.is_native_error(),
+        is_compile_error: false,
+      }),
     );
-
-    let is_native_error_key =
-      v8::String::new(tc_scope, "isNativeError").unwrap();
-    let is_native_error_val =
-      v8::Boolean::new(tc_scope, exception.is_native_error());
-    errinfo_obj.set(
-      tc_scope,
-      is_native_error_key.into(),
-      is_native_error_val.into(),
-    );
-
-    let thrown_key = v8::String::new(tc_scope, "thrown").unwrap();
-    errinfo_obj.set(tc_scope, thrown_key.into(), exception);
-
-    let js_one = v8::Integer::new(tc_scope, 1);
-    output.set(tc_scope, js_one.into(), errinfo_obj.into());
-
-    rv.set(output.into());
+    rv.set(to_v8(tc_scope, output).unwrap());
     return;
   }
 
-  let js_zero = v8::Integer::new(tc_scope, 0);
-  let js_one = v8::Integer::new(tc_scope, 1);
-  let js_null = v8::null(tc_scope);
-  output.set(tc_scope, js_zero.into(), result.unwrap());
-  output.set(tc_scope, js_one.into(), js_null.into());
-  rv.set(output.into());
+  let output = Output(Some(result.unwrap().into()), None);
+  rv.set(to_v8(tc_scope, output).unwrap());
 }
 
 fn encode(
@@ -767,7 +752,7 @@ pub fn module_resolve_callback<'s>(
 
   let referrer_global = v8::Global::new(scope, referrer);
   let referrer_info = state
-    .modules
+    .module_map
     .get_info(&referrer_global)
     .expect("ModuleInfo not found");
   let referrer_name = referrer_info.name.to_string();
@@ -784,8 +769,8 @@ pub fn module_resolve_callback<'s>(
     )
     .expect("Module should have been already resolved");
 
-  if let Some(id) = state.modules.get_id(resolved_specifier.as_str()) {
-    if let Some(handle) = state.modules.get_handle(id) {
+  if let Some(id) = state.module_map.get_id(resolved_specifier.as_str()) {
+    if let Some(handle) = state.module_map.get_handle(id) {
       return Some(v8::Local::new(scope, handle));
     }
   }
@@ -816,30 +801,24 @@ fn get_promise_details(
     }
   };
 
-  let promise_details = v8::Array::new(scope, 2);
+  #[derive(Serialize)]
+  struct PromiseDetails<'s>(u32, Option<serde_v8::Value<'s>>);
 
   match promise.state() {
     v8::PromiseState::Pending => {
-      let js_zero = v8::Integer::new(scope, 0);
-      promise_details.set(scope, js_zero.into(), js_zero.into());
-      rv.set(promise_details.into());
+      rv.set(to_v8(scope, PromiseDetails(0, None)).unwrap());
     }
     v8::PromiseState::Fulfilled => {
-      let js_zero = v8::Integer::new(scope, 0);
-      let js_one = v8::Integer::new(scope, 1);
       let promise_result = promise.result(scope);
-      promise_details.set(scope, js_zero.into(), js_one.into());
-      promise_details.set(scope, js_one.into(), promise_result);
-      rv.set(promise_details.into());
+      rv.set(
+        to_v8(scope, PromiseDetails(1, Some(promise_result.into()))).unwrap(),
+      );
     }
     v8::PromiseState::Rejected => {
-      let js_zero = v8::Integer::new(scope, 0);
-      let js_one = v8::Integer::new(scope, 1);
-      let js_two = v8::Integer::new(scope, 2);
       let promise_result = promise.result(scope);
-      promise_details.set(scope, js_zero.into(), js_two.into());
-      promise_details.set(scope, js_one.into(), promise_result);
-      rv.set(promise_details.into());
+      rv.set(
+        to_v8(scope, PromiseDetails(2, Some(promise_result.into()))).unwrap(),
+      );
     }
   }
 }
@@ -878,18 +857,62 @@ fn get_proxy_details(
     }
   };
 
-  let proxy_details = v8::Array::new(scope, 2);
-  let js_zero = v8::Integer::new(scope, 0);
-  let js_one = v8::Integer::new(scope, 1);
   let target = proxy.get_target(scope);
   let handler = proxy.get_handler(scope);
-  proxy_details.set(scope, js_zero.into(), target);
-  proxy_details.set(scope, js_one.into(), handler);
-  rv.set(proxy_details.into());
+  let p: (serde_v8::Value, serde_v8::Value) = (target.into(), handler.into());
+  rv.set(to_v8(scope, p).unwrap());
 }
 
 fn throw_type_error(scope: &mut v8::HandleScope, message: impl AsRef<str>) {
   let message = v8::String::new(scope, message.as_ref()).unwrap();
   let exception = v8::Exception::type_error(scope, message);
   scope.throw_exception(exception);
+}
+
+fn heap_stats(
+  scope: &mut v8::HandleScope,
+  _args: v8::FunctionCallbackArguments,
+  mut rv: v8::ReturnValue,
+) {
+  let stats = get_heap_stats(scope);
+  rv.set(to_v8(scope, stats).unwrap());
+}
+
+// HeapStats stores values from a isolate.get_heap_statistics() call
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HeapStats {
+  total_heap_size: usize,
+  total_heap_size_executable: usize,
+  total_physical_size: usize,
+  total_available_size: usize,
+  total_global_handles_size: usize,
+  used_global_handles_size: usize,
+  used_heap_size: usize,
+  heap_size_limit: usize,
+  malloced_memory: usize,
+  external_memory: usize,
+  peak_malloced_memory: usize,
+  number_of_native_contexts: usize,
+  number_of_detached_contexts: usize,
+}
+fn get_heap_stats(isolate: &mut v8::Isolate) -> HeapStats {
+  let mut s = v8::HeapStatistics::default();
+  isolate.get_heap_statistics(&mut s);
+
+  HeapStats {
+    total_heap_size: s.total_heap_size(),
+    total_heap_size_executable: s.total_heap_size_executable(),
+    total_physical_size: s.total_physical_size(),
+    total_available_size: s.total_available_size(),
+    total_global_handles_size: s.total_global_handles_size(),
+    used_global_handles_size: s.used_global_handles_size(),
+    used_heap_size: s.used_heap_size(),
+    heap_size_limit: s.heap_size_limit(),
+    malloced_memory: s.malloced_memory(),
+    external_memory: s.external_memory(),
+    peak_malloced_memory: s.peak_malloced_memory(),
+    number_of_native_contexts: s.number_of_native_contexts(),
+    number_of_detached_contexts: s.number_of_detached_contexts(),
+  }
 }

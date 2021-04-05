@@ -2,11 +2,11 @@
 
 #![deny(warnings)]
 
+use deno_core::error::null_opbuf;
 use deno_core::error::AnyError;
 use deno_core::serde::Deserialize;
 use deno_core::serde_json::json;
 use deno_core::serde_json::Value;
-use deno_core::BufVec;
 use deno_core::JsRuntime;
 use deno_core::OpState;
 use deno_core::ZeroCopyBuf;
@@ -37,15 +37,15 @@ pub fn get_declaration() -> PathBuf {
 pub fn op_crypto_get_random_values(
   state: &mut OpState,
   _args: Value,
-  zero_copy: &mut [ZeroCopyBuf],
+  zero_copy: Option<ZeroCopyBuf>,
 ) -> Result<Value, AnyError> {
-  assert_eq!(zero_copy.len(), 1);
+  let mut zero_copy = zero_copy.ok_or_else(null_opbuf)?;
   let maybe_seeded_rng = state.try_borrow_mut::<StdRng>();
   if let Some(seeded_rng) = maybe_seeded_rng {
-    seeded_rng.fill(&mut *zero_copy[0]);
+    seeded_rng.fill(&mut *zero_copy);
   } else {
     let mut rng = thread_rng();
-    rng.fill(&mut *zero_copy[0]);
+    rng.fill(&mut *zero_copy);
   }
 
   Ok(json!({}))
@@ -74,20 +74,15 @@ static DIGEST_ALGORITHMS: [&ring::digest::Algorithm; 4] = [
 pub async fn op_crypto_subtle_digest(
   _state: Rc<RefCell<OpState>>,
   args: Value,
-  zero_copy: BufVec,
+  zero_copy: Option<ZeroCopyBuf>,
 ) -> Result<Value, AnyError> {
-  let mut zc = zero_copy;
+  let zero_copy = zero_copy.ok_or_else(null_opbuf)?;
 
   let alg: DigestAlgorithmName = serde_json::from_value(args)?;
   let digest_algorithm = DIGEST_ALGORITHMS[alg as usize];
 
-  tokio::task::spawn_blocking(move || {
-    let digest = ring::digest::digest(digest_algorithm, &zc[0]);
-    // The buffer is allocated on the JS side, where we need to know in advance
-    // the byte length of the output for a given digest algorithm.
-    // This asserts that the anticipated length is equal to the actual length.
-    assert_eq!(digest.algorithm().output_len, zc[1].as_ref().len());
-    zc[1].copy_from_slice(digest.as_ref());
+  let _digest = tokio::task::spawn_blocking(move || {
+    ring::digest::digest(digest_algorithm, &zero_copy)
   })
   .await?;
 

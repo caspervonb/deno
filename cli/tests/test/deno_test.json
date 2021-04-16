@@ -1,0 +1,75 @@
+Check file:///home/caspervonb/deno/cli/tests/test/test_runner_test.ts
+{
+  "messages": [
+    {
+      "kind": "plan",
+      "data": {
+        "pending": 4,
+        "filtered": 0,
+        "only": false
+      }
+    },
+    {
+      "kind": "wait",
+      "data": {
+        "name": "fail1"
+      }
+    },
+    {
+      "kind": "result",
+      "data": {
+        "name": "fail1",
+        "duration": [WILDCARD],
+        "result": {
+          "failed": "AssertionError: fail1 assertion\n    at assert ([WILDCARD]:6:3\n    at asyncOpSanitizer (deno:runtime/js/40_testing.js:20:15)\n    at resourceSanitizer (deno:runtime/js/40_testing.js:57:13)\n    at exitSanitizer (deno:runtime/js/40_testing.js:84:15)\n    at runTest (deno:runtime/js/40_testing.js:224:13)\n    at Object.runTests (deno:runtime/js/40_testing.js:269:13)\n    at file:///home/caspervonb/deno/cli/tests/__anonymous__:1:21"
+        }
+      }
+    },
+    {
+      "kind": "wait",
+      "data": {
+        "name": "fail2"
+      }
+    },
+    {
+      "kind": "result",
+      "data": {
+        "name": "fail2",
+        "duration": [WILDCARD],
+        "result": {
+          "failed": "AssertionError: fail2 assertion\n    at assert ([WILDCARD]:10:3\n    at asyncOpSanitizer (deno:runtime/js/40_testing.js:20:15)\n    at resourceSanitizer (deno:runtime/js/40_testing.js:57:13)\n    at exitSanitizer (deno:runtime/js/40_testing.js:84:15)\n    at runTest (deno:runtime/js/40_testing.js:224:13)\n    at Object.runTests (deno:runtime/js/40_testing.js:269:13)"
+        }
+      }
+    },
+    {
+      "kind": "wait",
+      "data": {
+        "name": "success1"
+      }
+    },
+    {
+      "kind": "result",
+      "data": {
+        "name": "success1",
+        "duration": [WILDCARD],
+        "result": "ok"
+      }
+    },
+    {
+      "kind": "wait",
+      "data": {
+        "name": "fail3"
+      }
+    },
+    {
+      "kind": "result",
+      "data": {
+        "name": "fail3",
+        "duration": [WILDCARD],
+        "result": {
+          "failed": "AssertionError: fail3 assertion\n    at assert ([WILDCARD]:18:3\n    at asyncOpSanitizer (deno:runtime/js/40_testing.js:20:15)\n    at resourceSanitizer (deno:runtime/js/40_testing.js:57:13)\n    at exitSanitizer (deno:runtime/js/40_testing.js:84:15)\n    at runTest (deno:runtime/js/40_testing.js:224:13)\n    at Object.runTests (deno:runtime/js/40_testing.js:269:13)"
+        }
+      }
+    }
+  ]
+}

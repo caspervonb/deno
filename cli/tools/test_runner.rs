@@ -15,6 +15,8 @@ use deno_core::error::AnyError;
 use deno_core::futures::future;
 use deno_core::futures::stream;
 use deno_core::futures::StreamExt;
+use deno_core::serde_json;
+use deno_core::serde::Serialize;
 use deno_core::serde_json::json;
 use deno_core::url::Url;
 use deno_core::ModuleSpecifier;
@@ -142,8 +144,41 @@ impl TestReporter for PrettyTestReporter {
   }
 }
 
-fn create_reporter() -> Box<dyn TestReporter + Send> {
-  Box::new(PrettyTestReporter::new())
+#[derive(Serialize)]
+struct JsonTestReporter {
+    messages: Vec<TestMessage>,
+}
+
+impl JsonTestReporter {
+    fn new() -> JsonTestReporter {
+        JsonTestReporter {
+            messages: Vec::new(),
+        }
+    }
+}
+
+impl TestReporter for JsonTestReporter {
+    fn visit_message(&mut self, message: TestMessage) {
+        self.messages.push(message);
+    }
+
+    fn done(&mut self) {
+        let json = serde_json::to_string_pretty(&self);
+        println!("{}", json.unwrap());
+    }
+}
+
+
+enum TestReporterKind {
+    Pretty,
+    Json,
+}
+
+fn create_reporter(kind: TestReporterKind) -> Box<dyn TestReporter + Send> {
+  match kind {
+    TestReporterKind::Pretty => Box::new(PrettyTestReporter::new()),
+    TestReporterKind::Json => Box::new(JsonTestReporter::new()),
+  }
 }
 
 fn is_supported(p: &Path) -> bool {
@@ -265,6 +300,7 @@ pub async fn run_tests(
   allow_none: bool,
   filter: Option<String>,
   concurrent_jobs: usize,
+  json: bool,
 ) -> Result<(), AnyError> {
   let program_state = ProgramState::build(flags.clone()).await?;
   let permissions = Permissions::from_options(&flags.clone().into());
@@ -330,7 +366,13 @@ pub async fn run_tests(
     .buffer_unordered(concurrent_jobs)
     .collect::<Vec<Result<Result<(), AnyError>, tokio::task::JoinError>>>();
 
-  let mut reporter = create_reporter();
+  let reporter_kind = if json {
+    TestReporterKind::Json
+  } else {
+    TestReporterKind::Pretty
+  };
+
+  let mut reporter = create_reporter(reporter_kind);
   let handler = {
     tokio::task::spawn_blocking(move || {
       let mut used_only = false;

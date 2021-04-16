@@ -104,6 +104,7 @@ pub enum DenoSubcommand {
     include: Option<Vec<String>>,
     filter: Option<String>,
     concurrent_jobs: usize,
+    json: bool,
   },
   Types,
   Upgrade {
@@ -738,6 +739,8 @@ fn test_parse(flags: &mut Flags, matches: &clap::ArgMatches) {
     1
   };
 
+  let json = matches.is_present("json");
+
   if matches.is_present("script_arg") {
     let script_arg: Vec<String> = matches
       .values_of("script_arg")
@@ -770,6 +773,7 @@ fn test_parse(flags: &mut Flags, matches: &clap::ArgMatches) {
     filter,
     allow_none,
     concurrent_jobs,
+    json,
   };
 }
 
@@ -1554,6 +1558,12 @@ fn test_subcommand<'a, 'b>() -> App<'a, 'b> {
           Ok(_) => Ok(()),
           Err(_) => Err("jobs should be a number".to_string()),
         }),
+    )
+    .arg(
+      Arg::with_name("json")
+        .long("json")
+        .help("Outputs the information in JSON format")
+        .takes_value(false),
     )
     .arg(
       Arg::with_name("files")
@@ -3369,6 +3379,7 @@ mod tests {
           quiet: false,
           include: Some(svec!["dir1/", "dir2/"]),
           concurrent_jobs: 1,
+          json: false,
         },
         unstable: true,
         coverage_dir: Some("cov".to_string()),

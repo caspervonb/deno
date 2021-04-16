@@ -930,6 +930,7 @@ async fn test_command(
   allow_none: bool,
   filter: Option<String>,
   concurrent_jobs: usize,
+  json: bool,
 ) -> Result<(), AnyError> {
   if let Some(ref coverage_dir) = flags.coverage_dir {
     env::set_var("DENO_UNSTABLE_COVERAGE_DIR", coverage_dir);
@@ -944,6 +945,7 @@ async fn test_command(
     allow_none,
     filter,
     concurrent_jobs,
+    json,
   )
   .await?;
 
@@ -1081,6 +1083,7 @@ fn get_subcommand(
       allow_none,
       filter,
       concurrent_jobs,
+      json,
     } => test_command(
       flags,
       include,
@@ -1090,6 +1093,7 @@ fn get_subcommand(
       allow_none,
       filter,
       concurrent_jobs,
+      json,
     )
     .boxed_local(),
     DenoSubcommand::Completions { buf } => {

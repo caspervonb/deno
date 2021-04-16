@@ -1,29 +1,150 @@
 // Copyright 2018-2021 the Deno authors. All rights reserved. MIT license.
 
 use crate::colors;
-use crate::module_graph;
-use crate::tokio_util;
-use deno_core::ModuleSpecifier;
-use std::sync::mpsc::channel;
-use crate::flags::Flags;
-use std::sync::mpsc::Sender;
-use std::sync::Arc;
-use deno_runtime::permissions::Permissions;
-use crate::program_state::ProgramState;
-use deno_core::serde_json::json;
 use crate::create_main_worker;
+use crate::flags::Flags;
 use crate::fs_util;
-use crate::tools::installer::is_remote_url;
-use crate::tools::coverage::CoverageCollector;
-use deno_core::error::AnyError;
-use deno_core::url::Url;
-use std::path::Path;
+use crate::module_graph;
+use crate::program_state::ProgramState;
 use crate::test_dispatcher::TestMessage;
 use crate::test_dispatcher::TestResult;
+use crate::tokio_util;
+use crate::tools::coverage::CoverageCollector;
+use crate::tools::installer::is_remote_url;
+use deno_core::error::AnyError;
 use deno_core::futures::future;
 use deno_core::futures::stream;
 use deno_core::futures::StreamExt;
+use deno_core::serde_json::json;
+use deno_core::url::Url;
+use deno_core::ModuleSpecifier;
+use deno_runtime::permissions::Permissions;
+use std::path::Path;
 use std::path::PathBuf;
+use std::sync::mpsc::channel;
+use std::sync::mpsc::Sender;
+use std::sync::Arc;
+use std::time::Instant;
+
+trait TestReporter {
+  fn visit_message(&mut self, message: TestMessage);
+  fn done(&mut self);
+}
+
+struct PrettyTestReporter {
+  time: Instant,
+  failed: usize,
+  filtered_out: usize,
+  ignored: usize,
+  passed: usize,
+  measured: usize,
+  failures: Vec<(String, String)>,
+}
+
+impl PrettyTestReporter {
+  fn new() -> PrettyTestReporter {
+    PrettyTestReporter {
+      time: Instant::now(),
+      failed: 0,
+      filtered_out: 0,
+      ignored: 0,
+      passed: 0,
+      measured: 0,
+      failures: Vec::new(),
+    }
+  }
+}
+
+impl TestReporter for PrettyTestReporter {
+  fn visit_message(&mut self, message: TestMessage) {
+    match &message {
+      TestMessage::Plan {
+        pending,
+        filtered,
+        only: _,
+      } => {
+        println!("running {} tests", pending);
+        self.filtered_out += filtered;
+      }
+
+      TestMessage::Result {
+        name,
+        duration,
+        result,
+      } => match result {
+        TestResult::Ok => {
+          println!(
+            "test {} ... {} {}",
+            name,
+            colors::green("ok"),
+            colors::gray(format!("({}ms)", duration))
+          );
+
+          self.passed += 1;
+        }
+        TestResult::Ignored => {
+          println!(
+            "test {} ... {} {}",
+            name,
+            colors::yellow("ignored"),
+            colors::gray(format!("({}ms)", duration))
+          );
+
+          self.ignored += 1;
+        }
+        TestResult::Failed(error) => {
+          println!(
+            "test {} ... {} {}",
+            name,
+            colors::red("FAILED"),
+            colors::gray(format!("({}ms)", duration))
+          );
+
+          self.failed += 1;
+          self.failures.push((name.to_string(), error.to_string()));
+        }
+      },
+      _ => {}
+    }
+  }
+
+  fn done(&mut self) {
+    if !self.failures.is_empty() {
+      println!("\nfailures:\n");
+      for (name, error) in &self.failures {
+        println!("{}", name);
+        println!("{}", error);
+        println!();
+      }
+
+      println!("failures:\n");
+      for (name, _) in &self.failures {
+        println!("\t{}", name);
+      }
+    }
+
+    let status = if self.failures.is_empty() {
+      colors::green("ok").to_string()
+    } else {
+      colors::red("FAILED").to_string()
+    };
+
+    println!(
+        "\ntest result: {}. {} passed; {} failed; {} ignored; {} measured; {} filtered out {}\n",
+        status,
+        self.passed,
+        self.failed,
+        self.ignored,
+        self.measured,
+        self.filtered_out,
+        colors::gray(format!("({}ms)", self.time.elapsed().as_millis())),
+      );
+  }
+}
+
+fn create_reporter() -> Box<dyn TestReporter + Send> {
+  Box::new(PrettyTestReporter::new())
+}
 
 fn is_supported(p: &Path) -> bool {
   use std::path::Component;
@@ -100,17 +221,18 @@ pub async fn run_test(
       .put::<Sender<TestMessage>>(channel.clone());
   }
 
-  let mut maybe_coverage_collector =
-    if let Some(ref coverage_dir) = program_state.coverage_dir {
-      let session = worker.create_inspector_session();
-      let coverage_dir = PathBuf::from(coverage_dir);
-      let mut coverage_collector = CoverageCollector::new(coverage_dir, session);
-      coverage_collector.start_collecting().await?;
+  let mut maybe_coverage_collector = if let Some(ref coverage_dir) =
+    program_state.coverage_dir
+  {
+    let session = worker.create_inspector_session();
+    let coverage_dir = PathBuf::from(coverage_dir);
+    let mut coverage_collector = CoverageCollector::new(coverage_dir, session);
+    coverage_collector.start_collecting().await?;
 
-      Some(coverage_collector)
-    } else {
-      None
-    };
+    Some(coverage_collector)
+  } else {
+    None
+  };
 
   let options = json!({
     "filter": filter,
@@ -133,7 +255,6 @@ pub async fn run_test(
   Ok(())
 }
 
-
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tests(
   flags: Flags,
@@ -144,7 +265,7 @@ pub async fn run_tests(
   allow_none: bool,
   filter: Option<String>,
   concurrent_jobs: usize,
-  ) -> Result<(), AnyError> {
+) -> Result<(), AnyError> {
   let program_state = ProgramState::build(flags.clone()).await?;
   let permissions = Permissions::from_options(&flags.clone().into());
   let cwd = std::env::current_dir().expect("No current directory");
@@ -209,111 +330,43 @@ pub async fn run_tests(
     .buffer_unordered(concurrent_jobs)
     .collect::<Vec<Result<Result<(), AnyError>, tokio::task::JoinError>>>();
 
+  let mut reporter = create_reporter();
   let handler = {
     tokio::task::spawn_blocking(move || {
-      let time = std::time::Instant::now();
-      let mut failed = 0;
-      let mut filtered_out = 0;
-      let mut ignored = 0;
-      let mut passed = 0;
-      let measured = 0;
-
       let mut used_only = false;
       let mut has_error = false;
-      let mut failures: Vec<(String, String)> = Vec::new();
 
       for message in receiver.iter() {
-        match message {
+        match message.clone() {
           TestMessage::Plan {
-            pending,
-            filtered,
+            pending: _,
+            filtered: _,
             only,
           } => {
-            println!("running {} tests", pending);
-
             if only {
               used_only = true;
             }
-
-            filtered_out += filtered;
           }
-
           TestMessage::Result {
-            name,
-            duration,
+            name: _,
+            duration: _,
             result,
           } => match result {
-            TestResult::Ok => {
-              println!(
-                "test {} ... {} {}",
-                name,
-                colors::green("ok"),
-                colors::gray(format!("({}ms)", duration))
-              );
-
-              passed += 1;
-            }
-            TestResult::Ignored => {
-              println!(
-                "test {} ... {} {}",
-                name,
-                colors::yellow("ignored"),
-                colors::gray(format!("({}ms)", duration))
-              );
-
-              ignored += 1;
-            }
-            TestResult::Failed(error) => {
-              println!(
-                "test {} ... {} {}",
-                name,
-                colors::red("FAILED"),
-                colors::gray(format!("({}ms)", duration))
-              );
-
-              failed += 1;
-              failures.push((name, error));
+            TestResult::Failed(_) => {
               has_error = true;
             }
+            _ => {}
           },
           _ => {}
         }
 
+        reporter.visit_message(message);
         if has_error && fail_fast {
           break;
         }
       }
 
-      if !failures.is_empty() {
-        println!("\nfailures:\n");
-        for (name, error) in &failures {
-          println!("{}", name);
-          println!("{}", error);
-          println!();
-        }
-
-        println!("failures:\n");
-        for (name, _) in &failures {
-          println!("\t{}", name);
-        }
-      }
-
-      let status = if failures.is_empty() {
-        colors::green("ok").to_string()
-      } else {
-        colors::red("FAILED").to_string()
-      };
-
-      println!(
-        "\ntest result: {}. {} passed; {} failed; {} ignored; {} measured; {} filtered out {}\n",
-        status,
-        passed,
-        failed,
-        ignored,
-        measured,
-        filtered_out,
-        colors::gray(format!("({}ms)", time.elapsed().as_millis())),
-      );
+      reporter.done();
 
       if used_only {
         println!(

@@ -936,15 +936,16 @@ async fn test_command(
   }
 
   tools::test_runner::run_tests(
-      flags,
-      include,
-      no_run,
-      fail_fast,
-      quiet,
-      allow_none,
-      filter,
-      concurrent_jobs,
-  ).await?;
+    flags,
+    include,
+    no_run,
+    fail_fast,
+    quiet,
+    allow_none,
+    filter,
+    concurrent_jobs,
+  )
+  .await?;
 
   Ok(())
 }

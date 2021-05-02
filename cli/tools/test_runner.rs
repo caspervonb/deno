@@ -15,8 +15,8 @@ use deno_core::error::AnyError;
 use deno_core::futures::future;
 use deno_core::futures::stream;
 use deno_core::futures::StreamExt;
-use deno_core::serde_json;
 use deno_core::serde::Serialize;
+use deno_core::serde_json;
 use deno_core::serde_json::json;
 use deno_core::url::Url;
 use deno_core::ModuleSpecifier;
@@ -146,32 +146,31 @@ impl TestReporter for PrettyTestReporter {
 
 #[derive(Serialize)]
 struct JsonTestReporter {
-    messages: Vec<TestMessage>,
+  messages: Vec<TestMessage>,
 }
 
 impl JsonTestReporter {
-    fn new() -> JsonTestReporter {
-        JsonTestReporter {
-            messages: Vec::new(),
-        }
+  fn new() -> JsonTestReporter {
+    JsonTestReporter {
+      messages: Vec::new(),
     }
+  }
 }
 
 impl TestReporter for JsonTestReporter {
-    fn visit_message(&mut self, message: TestMessage) {
-        self.messages.push(message);
-    }
+  fn visit_message(&mut self, message: TestMessage) {
+    self.messages.push(message);
+  }
 
-    fn done(&mut self) {
-        let json = serde_json::to_string_pretty(&self);
-        println!("{}", json.unwrap());
-    }
+  fn done(&mut self) {
+    let json = serde_json::to_string_pretty(&self);
+    println!("{}", json.unwrap());
+  }
 }
 
-
 enum TestReporterKind {
-    Pretty,
-    Json,
+  Pretty,
+  Json,
 }
 
 fn create_reporter(kind: TestReporterKind) -> Box<dyn TestReporter + Send> {
